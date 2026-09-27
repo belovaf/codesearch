@@ -249,3 +249,11 @@ Never `unwrap_or_default()` a store error on a search path — "no results" and 
 - **v1.3.3** — federation hardening release
 
 Older entries: see `CHANGELOG.md`.
+
+## Plan (issue #192: debug builds + rust-lld, per audit #191)
+
+- rust-lld in .cargo/config.toml (msvc host) — measured 2m56s -> 1m32s bin rebuild
+- build.ps1 refuses -Release; CI (release.yml) builds release artifacts
+- sccache rejected (caches compilation, disables incremental — same as #191)
+- tests/ has 5 integration binaries — consolidation not warranted
+- README build-from-source keeps --release (end users want optimized)
