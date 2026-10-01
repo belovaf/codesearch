@@ -69,8 +69,11 @@ pub struct FindImpactResult {
     /// reference list may be INCOMPLETE — a helper failure was survived
     /// rather than fatal (a project that would not compile, an exception
     /// during reference resolution, a non-zero scip-typescript exit) and
-    /// the partial result was kept. Entries name what failed. Omitted when
-    /// empty: absent means the answer is as complete as the index knows.
+    /// the partial result was kept, OR the index itself was built out of a
+    /// partially loaded solution (index-level rebuild warnings, e.g.
+    /// MSBuild project-load failures; see `SymbolIndexer::index_warnings`).
+    /// Entries name what failed. Omitted when empty: absent means the
+    /// answer is as complete as the index knows.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
     /// Seconds since the symbol index was last rebuilt.
@@ -447,6 +450,17 @@ pub trait SymbolIndexer: Send + Sync {
 
     /// How old is the current symbol index (seconds since last rebuild)?
     fn index_age(&self, db_path: &Path) -> u64;
+
+    /// Index-level completeness warnings from the last rebuild — build
+    /// environment failures the language helper survived while still
+    /// producing an index (e.g. MSBuild project-load failures for C#).
+    /// Non-empty means reference lists from this index may be incomplete
+    /// EVEN WHEN a lookup succeeds, and callers should attach these
+    /// warnings to answers served from this index. Plain read; empty is
+    /// the default for adapters that do not track build-environment state.
+    fn index_warnings(&self, _db_path: &Path) -> Vec<String> {
+        Vec::new()
+    }
 
     /// The git HEAD sha the current symbol index was built for, when
     /// recorded. `None` means unknown (pre-fingerprint index, or git was

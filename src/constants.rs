@@ -655,6 +655,13 @@ pub const SCIP_HEAD_SHA_KEY: &str = "head_sha";
 /// old-format keys being served as fresh.
 pub const SCIP_KEY_FORMAT_KEY: &str = "key_format";
 
+/// LMDB metadata key holding a JSON array of index-level completeness
+/// warnings from the last rebuild (workspace/MSBuild failures the helper
+/// survived while still producing an index). Absent or empty = built clean.
+/// Surfaced on every `find_impact` answer from that index — a reference
+/// list out of a partially loaded solution may be missing callers.
+pub const SCIP_INDEX_WARNINGS_KEY: &str = "index_warnings";
+
 /// Current value written for [`SCIP_KEY_FORMAT_KEY`]. Bump whenever the
 /// canonical SCIP symbol key format produced by a language helper changes
 /// shape (B4: C# generic arity / containing-type path / fully qualified

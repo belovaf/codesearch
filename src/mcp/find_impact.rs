@@ -381,6 +381,10 @@ impl CodesearchService {
         // helper invocation — as a typed candidates answer; the server never
         // silently picks among the query's matches (the old behaviour took
         // the shortest fuzzy candidate and answered about the wrong symbol).
+        // The same read pass collects the index-level rebuild warnings: a
+        // partially loaded solution produces an index whose reference lists
+        // are incomplete EVEN WHEN the lookup succeeds, and that honesty
+        // rides on every answer from this index.
         let registry_for_resolve = self.symbol_registry.clone();
         let language_for_resolve = language_for_lookup.clone();
         let db_path_for_resolve = db_path.clone();
@@ -394,7 +398,9 @@ impl CodesearchService {
                         language_for_resolve
                     )
                 })?;
-            indexer.resolve_query(&db_path_for_resolve, &query_for_resolve)
+            let resolution = indexer.resolve_query(&db_path_for_resolve, &query_for_resolve)?;
+            let index_warnings = indexer.index_warnings(&db_path_for_resolve);
+            Ok((resolution, index_warnings))
         })
         .await
         {
@@ -403,6 +409,21 @@ impl CodesearchService {
             // a JoinError is folded into the lookup-failure path below
             // (classified stale/failed by the index age) instead of `?`.
             Err(e) => Err(anyhow::anyhow!("symbol resolve task failed: {e:#}")),
+        };
+        // Both are read from the SAME env/txn pass above; on a JoinError the
+        // warnings are unknown and the failure path below speaks for itself.
+        let (resolution, index_warnings) = match resolution {
+            Ok((resolution, index_warnings)) => (Ok(resolution), index_warnings),
+            Err(e) => (Err(e), Vec::new()),
+        };
+        // Warnings assembled per answer path: persisted per-symbol warnings
+        // (set at the lookup sites) + index-level rebuild warnings. The
+        // missing-index self-heal warning does NOT belong here — a successful
+        // resolution proves usable data exists (see the NotFound arm, the
+        // only payload that carries it).
+        let answer_warnings = |mut persisted: Vec<String>| -> Vec<String> {
+            persisted.extend(index_warnings.iter().cloned());
+            persisted
         };
 
         let canonical = match resolution {
@@ -451,10 +472,12 @@ impl CodesearchService {
             }
             Ok(crate::symbols::KeyMatch::NotFound) => {
                 // Preserve the historical contract for fuzzy queries: an
-                // unresolvable name/position answers empty references. With a
-                // missing index that answer also carries the self-heal
+                // unresolvable name/position answers empty references. With
+                // a missing index that answer also carries the self-heal
                 // warning — empty must not pass for "no callers".
-                let impact = build_impact(Vec::new(), None, heal_warning);
+                let mut warnings = answer_warnings(Vec::new());
+                warnings.extend(heal_warning.iter().cloned());
+                let impact = build_impact(Vec::new(), None, warnings);
                 let json = serde_json::to_string(&impact).unwrap_or_else(|_| "{}".to_string());
                 return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
             }
@@ -497,7 +520,11 @@ impl CodesearchService {
                 // The warm retry must carry the same honesty as a fresh
                 // answer: read the persisted warnings for this key.
                 let warnings = indexer.lookup_warnings(&db_path, &canonical);
-                let impact = build_impact(references, Some(canonical.clone()), warnings);
+                let impact = build_impact(
+                    references,
+                    Some(canonical.clone()),
+                    answer_warnings(warnings),
+                );
                 let json = serde_json::to_string(&impact).unwrap_or_else(|_| "{}".to_string());
                 return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
             }
@@ -553,7 +580,7 @@ impl CodesearchService {
                 // Surface what the lookup survived: a partial answer must
                 // say so in its own payload, not only in a log line.
                 let warnings = indexer.lookup_warnings(&db_path, &canonical);
-                let impact = build_impact(references, Some(canonical), warnings);
+                let impact = build_impact(references, Some(canonical), answer_warnings(warnings));
                 let json = serde_json::to_string(&impact).unwrap_or_else(|_| "{}".to_string());
                 Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
             }

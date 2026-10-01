@@ -124,3 +124,122 @@ fn helper_warning_classification_table() {
         );
     }
 }
+
+// ── Index-level completeness warnings (features/always-on-symbol-indexes) ──
+
+/// The live MSBuild project-load failure format observed on the
+/// DRM-24427_Versioning worktree (NuGet restore broken: SonarAnalyzer
+/// version mismatch) — the exact line class whose warnings silently
+/// disappeared into the log while every find_impact answer read clean.
+const LIVE_MSBUILD_FAILURE: &str = "[WARN] Workspace error: [Failure] Msbuild failed when processing the file 'C:\\repos\\BOIN.Aprimo.worktrees\\DRM-24427_Versioning\\src\\Dlw.Aprimo.Dam\\Dlw.Aprimo.Dam.csproj' with message: Dlw.Aprimo.Dam depends on SonarAnalyzer.CSharp (>= 10.18.0.128626) but SonarAnalyzer.CSharp 10.18.0.128626 was not found. SonarAnalyzer.CSharp 10.18.0.131500 was resolved instead.";
+
+/// Normalization collapses the project-load failure to `<file>: <msg>`;
+/// duplicates (MSBuild repeats per project and per pass) dedupe; plain
+/// warning lines pass through trimmed; non-warning lines are dropped.
+#[test]
+fn summarize_index_warnings_normalizes_dedupes_and_skips_noise() {
+    let msbuild_second = "[WARN] Workspace error: [Failure] Msbuild failed when processing the file 'C:\\repos\\other\\src\\Dlw.Aprimo.Web\\Dlw.Aprimo.Web.csproj' with message: Dlw.Aprimo.Web depends on SonarAnalyzer.CSharp (>= 10.18.0.128626) but SonarAnalyzer.CSharp 10.18.0.128626 was not found. SonarAnalyzer.CSharp 10.18.0.131500 was resolved instead.";
+    let lines = vec![
+        "MSBuild: registering '.NET Core SDK' v10.0.401".to_string(), // info, dropped
+        LIVE_MSBUILD_FAILURE.to_string(),
+        LIVE_MSBUILD_FAILURE.to_string(), // duplicate, deduped
+        msbuild_second.to_string(),
+        "[WARN] Grpc.Net.ClientFactory 2.63.0 or earlier could cause issues".to_string(),
+        "".to_string(),
+    ];
+
+    let out = super::csharp::summarize_index_warnings(&lines, 10);
+
+    assert_eq!(out.len(), 3, "expected 3 distinct warnings, got: {out:?}");
+    assert!(
+        out[0].starts_with("Dlw.Aprimo.Dam.csproj: Dlw.Aprimo.Dam depends on SonarAnalyzer"),
+        "first entry must be the normalized project failure, got: {}",
+        out[0]
+    );
+    assert!(
+        out[1].starts_with("Dlw.Aprimo.Web.csproj: "),
+        "second entry must be the second project, got: {}",
+        out[1]
+    );
+    assert!(
+        out[2].starts_with("[WARN] Grpc"),
+        "unrecognized warning format passes through verbatim, got: {}",
+        out[2]
+    );
+    // The SonarAnalyzer message is longer than the 160-char cap — pinned so
+    // a persisted entry can never blow up the warnings array on answers.
+    let msg = out[0].split_once(": ").expect("normalized shape").1;
+    assert!(msg.chars().count() <= 160, "message must be capped");
+}
+
+/// The cap kicks in with an explicit overflow entry — the list rides on
+/// every find_impact answer and must stay bounded.
+#[test]
+fn summarize_index_warnings_caps_with_overflow_note() {
+    let lines: Vec<String> = (0..5)
+        .map(|i| format!("[WARN] distinct failure number {i}"))
+        .collect();
+    let out = super::csharp::summarize_index_warnings(&lines, 3);
+    assert_eq!(out.len(), 4, "3 capped entries + overflow note: {out:?}");
+    assert_eq!(out[3], "… and 2 more distinct warning(s)");
+}
+
+/// The meta roundtrip: what rebuild persists is what `index_warnings`
+/// returns; absent key and corrupt JSON both read as clean (never block an
+/// answer), and the TypeScript adapter inherits the empty default.
+#[test]
+fn index_warnings_roundtrip_and_clean_absence() {
+    use crate::symbols::SymbolIndexer as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("codesearch.db");
+
+    let csharp = super::csharp::CSharpSymbolIndexer::new();
+    assert!(
+        csharp.index_warnings(&db_path).is_empty(),
+        "absent meta must read as clean"
+    );
+
+    let env = crate::symbols::get_shared_scip_env(&db_path).unwrap();
+    let mut wtxn = env.write_txn().unwrap();
+    let meta: heed::Database<heed::types::Str, heed::types::Str> = env
+        .create_database(&mut wtxn, Some(crate::constants::SCIP_META_DB_NAME))
+        .unwrap();
+    let stored = vec![
+        "summary line".to_string(),
+        "Dlw.Aprimo.Dam.csproj: SonarAnalyzer.CSharp not found".to_string(),
+    ];
+    meta.put(
+        &mut wtxn,
+        crate::constants::SCIP_INDEX_WARNINGS_KEY,
+        serde_json::to_string(&stored).unwrap().as_str(),
+    )
+    .unwrap();
+    wtxn.commit().unwrap();
+
+    assert_eq!(
+        csharp.index_warnings(&db_path),
+        stored,
+        "persisted warnings must round-trip verbatim"
+    );
+
+    // Corrupt JSON reads as clean, not as an error.
+    let mut wtxn = env.write_txn().unwrap();
+    meta.put(
+        &mut wtxn,
+        crate::constants::SCIP_INDEX_WARNINGS_KEY,
+        "not json [",
+    )
+    .unwrap();
+    wtxn.commit().unwrap();
+    assert!(
+        csharp.index_warnings(&db_path).is_empty(),
+        "corrupt meta must read as clean, never fail the answer"
+    );
+
+    let ts = super::typescript::TypeScriptSymbolIndexer::new();
+    assert!(
+        ts.index_warnings(&db_path).is_empty(),
+        "non-tracking adapters inherit the empty default"
+    );
+}
