@@ -895,10 +895,11 @@ async fn never_built_index_warns_on_the_empty_answer() {
 
 /// Index-level rebuild warnings must ride on EVERY answer from an index
 /// built out of a partially loaded solution — resolved answers AND empty
-/// NotFound answers. This pins the DRM-24427 defect: MSBuild project-load
-/// failures (broken NuGet restore) produced an index with definitions but
-/// no cross-project references, and every answer passed as clean while an
-/// orphan-check read the empty lists as "no callers".
+/// NotFound answers. This pins the live defect reported on a customer
+/// worktree: MSBuild project-load failures (broken NuGet restore) produced
+/// an index with definitions but no cross-project references, and every
+/// answer passed as clean while an orphan-check read the empty lists as
+/// "no callers".
 #[tokio::test]
 #[serial_test::serial]
 async fn index_level_rebuild_warnings_ride_on_resolved_and_empty_answers() {
@@ -910,7 +911,7 @@ async fn index_level_rebuild_warnings_ride_on_resolved_and_empty_answers() {
     let index_warnings = vec![
         "The symbol index was built while the C# workspace reported 2 distinct failure(s) — cross-project references may be missing from every answer. Fix the underlying build problem (often a dotnet restore) and reindex."
             .to_string(),
-        "Dlw.Aprimo.Dam.csproj: depends on SonarAnalyzer.CSharp (>= 10.18.0.128626) but it was not found".to_string(),
+        "App.Dam.csproj: depends on Analyzer.X (>= 1.2.3) but it was not found".to_string(),
     ];
     write_index_warnings_meta(&db, &index_warnings);
 

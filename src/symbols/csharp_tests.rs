@@ -127,18 +127,19 @@ fn helper_warning_classification_table() {
 
 // ── Index-level completeness warnings (features/always-on-symbol-indexes) ──
 
-/// The live MSBuild project-load failure format observed on the
-/// DRM-24427_Versioning worktree (NuGet restore broken: SonarAnalyzer
-/// version mismatch) — the exact line class whose warnings silently
-/// disappeared into the log while every find_impact answer read clean.
-const LIVE_MSBUILD_FAILURE: &str = "[WARN] Workspace error: [Failure] Msbuild failed when processing the file 'C:\\repos\\BOIN.Aprimo.worktrees\\DRM-24427_Versioning\\src\\Dlw.Aprimo.Dam\\Dlw.Aprimo.Dam.csproj' with message: Dlw.Aprimo.Dam depends on SonarAnalyzer.CSharp (>= 10.18.0.128626) but SonarAnalyzer.CSharp 10.18.0.128626 was not found. SonarAnalyzer.CSharp 10.18.0.131500 was resolved instead.";
+/// The live MSBuild project-load failure format observed on a customer
+/// worktree (NuGet restore broken: analyzer package version mismatch) —
+/// the exact line class whose warnings silently disappeared into the log
+/// while every find_impact answer read clean. Identifiers anonymized; the
+/// shape is what the parser must match.
+const LIVE_MSBUILD_FAILURE: &str = "[WARN] Workspace error: [Failure] Msbuild failed when processing the file 'C:\\repos\\demo-worktree\\src\\App.Dam\\App.Dam.csproj' with message: App.Dam depends on Analyzer.X (>= 1.2.3) but Analyzer.X 1.2.3 was not found. Analyzer.X 1.3.0 was resolved instead.";
 
 /// Normalization collapses the project-load failure to `<file>: <msg>`;
 /// duplicates (MSBuild repeats per project and per pass) dedupe; plain
 /// warning lines pass through trimmed; non-warning lines are dropped.
 #[test]
 fn summarize_index_warnings_normalizes_dedupes_and_skips_noise() {
-    let msbuild_second = "[WARN] Workspace error: [Failure] Msbuild failed when processing the file 'C:\\repos\\other\\src\\Dlw.Aprimo.Web\\Dlw.Aprimo.Web.csproj' with message: Dlw.Aprimo.Web depends on SonarAnalyzer.CSharp (>= 10.18.0.128626) but SonarAnalyzer.CSharp 10.18.0.128626 was not found. SonarAnalyzer.CSharp 10.18.0.131500 was resolved instead.";
+    let msbuild_second = "[WARN] Workspace error: [Failure] Msbuild failed when processing the file 'C:\\repos\\other\\src\\App.Web\\App.Web.csproj' with message: App.Web depends on Analyzer.X (>= 1.2.3) but Analyzer.X 1.2.3 was not found. Analyzer.X 1.3.0 was resolved instead.";
     let lines = vec![
         "MSBuild: registering '.NET Core SDK' v10.0.401".to_string(), // info, dropped
         LIVE_MSBUILD_FAILURE.to_string(),
@@ -152,12 +153,12 @@ fn summarize_index_warnings_normalizes_dedupes_and_skips_noise() {
 
     assert_eq!(out.len(), 3, "expected 3 distinct warnings, got: {out:?}");
     assert!(
-        out[0].starts_with("Dlw.Aprimo.Dam.csproj: Dlw.Aprimo.Dam depends on SonarAnalyzer"),
+        out[0].starts_with("App.Dam.csproj: App.Dam depends on Analyzer.X"),
         "first entry must be the normalized project failure, got: {}",
         out[0]
     );
     assert!(
-        out[1].starts_with("Dlw.Aprimo.Web.csproj: "),
+        out[1].starts_with("App.Web.csproj: "),
         "second entry must be the second project, got: {}",
         out[1]
     );
@@ -166,8 +167,8 @@ fn summarize_index_warnings_normalizes_dedupes_and_skips_noise() {
         "unrecognized warning format passes through verbatim, got: {}",
         out[2]
     );
-    // The SonarAnalyzer message is longer than the 160-char cap — pinned so
-    // a persisted entry can never blow up the warnings array on answers.
+    // The failure message is longer than the 160-char cap — pinned so a
+    // persisted entry can never blow up the warnings array on answers.
     let msg = out[0].split_once(": ").expect("normalized shape").1;
     assert!(msg.chars().count() <= 160, "message must be capped");
 }
@@ -207,7 +208,7 @@ fn index_warnings_roundtrip_and_clean_absence() {
         .unwrap();
     let stored = vec![
         "summary line".to_string(),
-        "Dlw.Aprimo.Dam.csproj: SonarAnalyzer.CSharp not found".to_string(),
+        "App.Dam.csproj: Analyzer.X not found".to_string(),
     ];
     meta.put(
         &mut wtxn,
