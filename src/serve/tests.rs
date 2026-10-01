@@ -3450,6 +3450,166 @@ async fn run_phase_2_symbols_wires_candidate_through_to_trigger() {
     );
 }
 
+/// A successful rebuild WITHOUT survived failures is Ready with the error
+/// cleared; one WITH survived workspace failures is Partial (red `C#⚠` in
+/// the TUI) with a bounded detail line for the info panel — capped at the
+/// first three entries so the detail row stays readable.
+#[test]
+fn csharp_success_outcome_partial_when_warnings_survived() {
+    assert_eq!(
+        csharp_success_outcome(&[]),
+        (CSharpIndexStatus::Ready, None),
+        "a clean rebuild must read Ready with no error detail"
+    );
+
+    let degraded = [
+        "summary".to_string(),
+        "A.csproj: failure one".to_string(),
+        "B.csproj: failure two".to_string(),
+        "C.csproj: failure three".to_string(),
+        "D.csproj: failure four".to_string(),
+    ];
+    let (status, detail) = csharp_success_outcome(&degraded);
+    assert_eq!(status, CSharpIndexStatus::Partial);
+    let detail = detail.expect("partial carries detail");
+    assert!(
+        detail.contains("summary") && detail.contains("B.csproj"),
+        "detail joins the leading entries, got: {detail}"
+    );
+    assert!(
+        !detail.contains("D.csproj"),
+        "detail is capped at three entries, got: {detail}"
+    );
+}
+
+/// The watcher notifier must apply the SAME status contract as
+/// trigger_symbol_rebuild's success arm: Succeeded-with-warnings → Partial
+/// (red C#⚠) with bounded detail — never green — and a clean Succeeded →
+/// Ready with the detail cleared. Reverting the arm to insert(Ready) ships
+/// the round-1 defect (green indicator on a degraded index) with a green
+/// suite.
+#[test]
+fn csharp_notifier_partial_on_succeeded_with_warnings() {
+    let state = ServeState::new(ReposConfig::default(), None);
+    let notifier = state.make_csharp_notifier("wrepo");
+
+    notifier(SymbolRebuildSignal::Started);
+    assert_eq!(
+        state.csharp_index_status.get("wrepo").map(|e| *e.value()),
+        Some(CSharpIndexStatus::Indexing)
+    );
+
+    notifier(SymbolRebuildSignal::Succeeded {
+        index_warnings: vec![
+            "summary".to_string(),
+            "A.csproj: boom".to_string(),
+            "B.csproj: boom2".to_string(),
+            "C.csproj: boom3".to_string(),
+        ],
+    });
+    assert_eq!(
+        state.csharp_index_status.get("wrepo").map(|e| *e.value()),
+        Some(CSharpIndexStatus::Partial),
+        "a degraded watcher rebuild must render Partial, never green"
+    );
+    let detail = state
+        .csharp_index_error
+        .get("wrepo")
+        .map(|e| e.value().clone())
+        .expect("detail stored");
+    assert!(detail.contains("summary") && !detail.contains("C.csproj"));
+
+    notifier(SymbolRebuildSignal::Succeeded {
+        index_warnings: Vec::new(),
+    });
+    assert_eq!(
+        state.csharp_index_status.get("wrepo").map(|e| *e.value()),
+        Some(CSharpIndexStatus::Ready)
+    );
+    assert!(
+        !state.csharp_index_error.contains_key("wrepo"),
+        "a clean rebuild must clear the detail"
+    );
+}
+
+/// `repo_statuses_lightweight()` must carry the Partial status AND its
+/// detail message — that pair is what renders the red `C#⚠` and the info
+/// panel's failure line.
+#[test]
+fn repo_statuses_lightweight_carries_partial_with_detail() {
+    let (_tmp, _path, bare) = state_with_repo("partialrepo");
+    let state = std::sync::Arc::new(bare);
+    state
+        .csharp_index_status
+        .insert("partialrepo".to_string(), CSharpIndexStatus::Partial);
+    state.csharp_index_error.insert(
+        "partialrepo".to_string(),
+        "summary | A.csproj: failure one".to_string(),
+    );
+
+    let statuses = state.repo_statuses_lightweight();
+    let (_, info) = statuses
+        .iter()
+        .find(|(alias, _)| alias == "partialrepo")
+        .expect("partialrepo row");
+    assert_eq!(info.csharp_index, CSharpIndexStatus::Partial);
+    assert_eq!(
+        info.csharp_error.as_deref(),
+        Some("summary | A.csproj: failure one"),
+        "the detail message must ride on the status row"
+    );
+}
+
+/// The serve-tui `i` overlay reads the DURABLE warnings from the on-disk
+/// meta (survives a restart, unlike the in-memory status) and prefixes them
+/// with the language. A repo whose meta carries no warnings yields none.
+#[test]
+fn build_info_overlay_reads_symbol_warnings_from_meta() {
+    use crate::serve::tui::build_info_overlay;
+
+    let (_tmp, repo_path, bare) = state_with_repo("inforepo");
+    let db = repo_path.join(DB_DIR_NAME);
+    std::fs::create_dir_all(&db).unwrap();
+    std::fs::write(
+        db.join("metadata.json"),
+        r#"{"schema_version":1,"dimensions":2,"model_short_name":"minilm-l6-q"}"#,
+    )
+    .unwrap();
+    // Seed the meta the way a degraded rebuild does (see the roundtrip test
+    // in csharp_tests for the read side).
+    let env = crate::symbols::get_shared_scip_env(&db).unwrap();
+    let mut wtxn = env.write_txn().unwrap();
+    let meta: heed::Database<heed::types::Str, heed::types::Str> = env
+        .create_database(&mut wtxn, Some(crate::constants::SCIP_META_DB_NAME))
+        .unwrap();
+    meta.put(
+        &mut wtxn,
+        crate::constants::SCIP_INDEX_WARNINGS_KEY,
+        r#"["summary","A.csproj: failure one"]"#,
+    )
+    .unwrap();
+    wtxn.commit().unwrap();
+
+    let state = std::sync::Arc::new(bare);
+    let statuses = state.repo_statuses_lightweight();
+    let idx = statuses
+        .iter()
+        .position(|(alias, _)| alias == "inforepo")
+        .expect("inforepo row");
+    let overlay = build_info_overlay(idx, &statuses, &state).expect("overlay");
+    match overlay {
+        crate::serve::tui_common::OverlayState::Info {
+            symbol_warnings, ..
+        } => {
+            assert!(
+                symbol_warnings.len() == 2 && symbol_warnings[0].starts_with("[csharp] summary"),
+                "warnings must be language-prefixed from meta, got: {symbol_warnings:?}"
+            );
+        }
+        other => panic!("expected Info overlay, got {other:?}"),
+    }
+}
+
 /// The serve-mode find_impact self-heal spawn must reach
 /// `trigger_symbol_rebuild` for a registered, applicable repo: after the
 /// warned empty answer, the C# status eventually flips to Error (dummy

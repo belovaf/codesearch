@@ -380,6 +380,10 @@ pub struct RebuildSummary {
     pub references_stored: usize,
     /// Wall-clock duration in milliseconds.
     pub duration_ms: u64,
+    /// Index-level completeness warnings from this build (build-environment
+    /// failures the helper survived; see [`SymbolIndexer::index_warnings`]).
+    /// Empty = built clean. Drives the TUI's degraded indicator.
+    pub index_warnings: Vec<String>,
 }
 
 /// Summary returned after a Phase 3 pre-warm completes.

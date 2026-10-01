@@ -148,6 +148,11 @@ pub enum OverlayState {
         dims: usize,
         lock: String,
         index_age: String,
+        /// Index-level symbol warnings read fresh from the on-disk meta
+        /// (`scip_meta[index_warnings]`): build-environment failures the
+        /// helper survived. Unlike the in-memory C# status these survive a
+        /// serve restart — the durable record of a degraded index.
+        symbol_warnings: Vec<String>,
     },
     /// Info modal for a *mounted remote project* (federation peer). Remote
     /// mounts have no local on-disk index, so the chunk/file/db-size/model stats
@@ -341,14 +346,10 @@ pub fn render_table(
     let max_alias_w = repos
         .iter()
         .map(|r| {
-            // Each indicator (" C#·" / " TS·") is 4 display cols; account for both.
-            let mut extra = 0usize;
-            if matches!(r.csharp_index.as_str(), "ready" | "error" | "indexing") {
-                extra += 4;
-            }
-            if matches!(r.typescript_index.as_str(), "ready" | "error" | "indexing") {
-                extra += 4;
-            }
+            // Each indicator is a suffix like " C#·"; ⚠ (the partial glyph)
+            // is double-width (unicode-width EAW=W) so its variant budgets
+            // 6 display cols instead of 4.
+            let extra = indicator_cols(&r.csharp_index) + indicator_cols(&r.typescript_index);
             r.alias.len() + extra
         })
         .max()
@@ -390,6 +391,12 @@ pub fn render_table(
                     format!("{} C#·", repo.alias),
                     Style::default().fg(Color::White),
                 ),
+                // Degraded index: built despite survived workspace failures —
+                // red and loud, the detail panel carries the failures.
+                "partial" => (
+                    format!("{} C#⚠", repo.alias),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
                 "error" => (
                     format!("{} C#!", repo.alias),
                     Style::default().fg(Color::Red),
@@ -414,6 +421,10 @@ pub fn render_table(
                 "ready" => alias_text.push_str(" TS·"),
                 "error" => {
                     alias_text.push_str(" TS!");
+                    alias_style = alias_style.fg(Color::Red);
+                }
+                "partial" => {
+                    alias_text.push_str(" TS⚠");
                     alias_style = alias_style.fg(Color::Red);
                 }
                 "indexing" => alias_text.push_str(" TS…"),
@@ -592,8 +603,8 @@ pub fn render_detail(
 
     let info_line = Line::from(info_spans);
 
-    // Optional error line for C# errors
-    let error_line = if repo.csharp_index == "error" {
+    // Optional error line for C# errors and degraded (partial) indexes
+    let error_line = if matches!(repo.csharp_index.as_str(), "error" | "partial") {
         let err_msg = repo.csharp_error.as_deref().unwrap_or("Unknown error");
         const ERR_PREFIX_COLS: usize = 7;
         let max_err_chars = (area.width as usize).saturating_sub(ERR_PREFIX_COLS);
@@ -806,6 +817,7 @@ pub fn render_overlay(f: &mut ratatui::Frame, area: Rect, overlay: &OverlayState
             dims,
             lock,
             index_age,
+            symbol_warnings,
         } => {
             let title = format!(" {} — Index Info ", alias);
             let lines = vec![
@@ -855,12 +867,28 @@ pub fn render_overlay(f: &mut ratatui::Frame, area: Rect, overlay: &OverlayState
                     Span::styled("  Index age:   ", Style::default().fg(Color::DarkGray)),
                     Span::styled(index_age.clone(), Style::default().fg(Color::White)),
                 ]),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "  [Esc] close",
-                    Style::default().fg(Color::DarkGray),
-                )),
             ];
+            let mut lines = lines;
+            // Durable record of a degraded symbol index: the build problems
+            // the helper survived. Red, like the table's `C#⚠` indicator.
+            if !symbol_warnings.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "  ⚠ Symbol index warnings:",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )));
+                for warning in symbol_warnings {
+                    lines.push(Line::from(Span::styled(
+                        format!("    {warning}"),
+                        Style::default().fg(Color::Red),
+                    )));
+                }
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  [Esc] close",
+                Style::default().fg(Color::DarkGray),
+            )));
             render_centered_modal(f, area, &title, lines);
         }
         OverlayState::RemoteInfo {
@@ -1272,6 +1300,7 @@ fn detail_status_style(status: &str, csharp: &str) -> (String, Color) {
                 },
             ),
             "error" => ("Open C#!".to_string(), Color::Red),
+            "partial" => ("Open C#⚠".to_string(), Color::Red),
             _ => ("Open".to_string(), Color::Green),
         },
         "warm" => match csharp {
@@ -1285,6 +1314,7 @@ fn detail_status_style(status: &str, csharp: &str) -> (String, Color) {
                 },
             ),
             "error" => ("Warm C#!".to_string(), Color::Red),
+            "partial" => ("Warm C#⚠".to_string(), Color::Red),
             _ => ("Warm".to_string(), Color::Yellow),
         },
         "readonly" => ("Readonly".to_string(), Color::Cyan),
@@ -1310,6 +1340,17 @@ fn detail_status_style(status: &str, csharp: &str) -> (String, Color) {
         "error" => ("Error".to_string(), Color::Red),
         "no_index" => ("No Index".to_string(), Color::Gray),
         _ => (status.to_string(), Color::White),
+    }
+}
+
+/// Display width of one alias-column indicator suffix (`" C#·"` family).
+/// The partial glyph ⚠ is double-width (unicode-width EAW=W), so that
+/// variant budgets 6 display cols; the 1-col glyphs budget 4.
+fn indicator_cols(status: &str) -> usize {
+    match status {
+        "ready" | "error" | "indexing" => 4,
+        "partial" => 6,
+        _ => 0,
     }
 }
 
@@ -1353,6 +1394,37 @@ mod tests {
             detail_status_style("closed", ""),
             ("Idle".to_string(), Color::Gray)
         );
+    }
+
+    /// A degraded (partial) C# index renders red with the ⚠ glyph in the
+    /// detail panel — same urgency class as an error, distinct label.
+    #[test]
+    fn detail_status_style_maps_partial_to_red_warning() {
+        assert_eq!(
+            detail_status_style("open", "partial"),
+            ("Open C#⚠".to_string(), Color::Red)
+        );
+        assert_eq!(
+            detail_status_style("warm", "partial"),
+            ("Warm C#⚠".to_string(), Color::Red)
+        );
+    }
+
+    /// The alias-column width budget must cover the actually rendered
+    /// suffixes: the partial glyph ⚠ is double-width (EAW=W), so " C#⚠" is
+    /// 5 display cols — budgeting it at 4 (the 1-col glyph family) would
+    /// clip the ⚠ exactly when a partial row defines the widest alias.
+    #[test]
+    fn indicator_cols_budgets_double_width_partial_glyph() {
+        assert_eq!(indicator_cols("ready"), 4);
+        assert_eq!(indicator_cols("error"), 4);
+        assert_eq!(indicator_cols("indexing"), 4);
+        assert_eq!(
+            indicator_cols("partial"),
+            6,
+            "double-width glyph needs more than the 4-col family budget"
+        );
+        assert_eq!(indicator_cols("none"), 0);
     }
 
     #[test]

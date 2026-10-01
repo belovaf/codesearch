@@ -92,10 +92,33 @@ pub(crate) enum CSharpIndexStatus {
     None,
     /// Helper available and index built successfully.
     Ready,
+    /// Index built, but the helper survived workspace/MSBuild failures —
+    /// definitions are present while cross-project references may be
+    /// missing. Rendered red (`C#⚠`) in the TUI; the failures are in the
+    /// info panel and on every find_impact answer from this index.
+    Partial,
     /// Index exists but had errors or is stale.
     Error,
     /// Symbol index is currently being built.
     Indexing,
+}
+
+/// Outcome of a SUCCESSFUL C# symbol rebuild, derived from the rebuild's
+/// index warnings: clean → Ready (error cleared), survived failures →
+/// Partial with a bounded detail line for the TUI info panel. Pure so the
+/// status contract is testable without running a helper.
+fn csharp_success_outcome(index_warnings: &[String]) -> (CSharpIndexStatus, Option<String>) {
+    if index_warnings.is_empty() {
+        (CSharpIndexStatus::Ready, None)
+    } else {
+        let detail = index_warnings
+            .iter()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" | ");
+        (CSharpIndexStatus::Partial, Some(detail))
+    }
 }
 
 /// Lightweight repo status derived from DashMap state only (no DB opens).
@@ -622,9 +645,17 @@ impl ServeState {
                 // watcher-triggered rebuild, matching `trigger_symbol_rebuild`.
                 status_map.insert(alias_key.clone(), CSharpIndexStatus::Indexing);
             }
-            SymbolRebuildSignal::Succeeded => {
-                status_map.insert(alias_key.clone(), CSharpIndexStatus::Ready);
-                error_map.remove(&alias_key);
+            SymbolRebuildSignal::Succeeded { index_warnings } => {
+                // Same contract as trigger_symbol_rebuild's success arm: a
+                // rebuild that survived workspace failures is Partial (red
+                // C#⚠) with the failures as the info detail — never green.
+                let (status, detail) = csharp_success_outcome(&index_warnings);
+                status_map.insert(alias_key.clone(), status);
+                if let Some(detail) = detail {
+                    error_map.insert(alias_key.clone(), detail);
+                } else {
+                    error_map.remove(&alias_key);
+                }
             }
             SymbolRebuildSignal::Failed(msg) => {
                 error_map.insert(alias_key.clone(), msg);
@@ -3314,6 +3345,29 @@ impl ServeState {
         self.active_sessions.load(Ordering::Relaxed)
     }
 
+    /// Durable symbol-index warnings for the info surfaces: read fresh from
+    /// the on-disk meta of every symbol language, language-prefixed.
+    /// Deliberately NOT filtered by installed languages — reading meta needs
+    /// no helper, and a helper that vanished after a degraded rebuild must
+    /// not hide the record. Unlike the in-memory C# status this survives a
+    /// serve restart.
+    pub(crate) fn collect_symbol_warnings(&self, db_path: &Path) -> Vec<String> {
+        let mut warnings: Vec<String> = Vec::new();
+        for lang in [LANG_CSHARP, LANG_TYPESCRIPT] {
+            if let Some(indexer) = self.symbol_registry.get(lang) {
+                let lang_warnings = indexer.index_warnings(db_path);
+                if !lang_warnings.is_empty() {
+                    warnings.extend(
+                        lang_warnings
+                            .into_iter()
+                            .map(|w| format!("[{}] {w}", indexer.language())),
+                    );
+                }
+            }
+        }
+        warnings
+    }
+
     /// Get lightweight repo statuses WITHOUT opening any databases.
     /// Returns a list of (alias, status_info) where status is derived from DashMap state only.
     pub(crate) fn repo_statuses_lightweight(&self) -> Vec<(String, RepoStatusInfo)> {
@@ -3394,7 +3448,10 @@ impl ServeState {
                     }
                 });
 
-            let csharp_error = if matches!(csharp_index, CSharpIndexStatus::Error) {
+            let csharp_error = if matches!(
+                csharp_index,
+                CSharpIndexStatus::Error | CSharpIndexStatus::Partial
+            ) {
                 self.csharp_index_error
                     .get(alias)
                     .map(|e: dashmap::mapref::one::Ref<String, String>| e.value().clone())
@@ -3853,12 +3910,14 @@ async fn status_handler(
             let csharp_str = match info.csharp_index {
                 CSharpIndexStatus::None => "none",
                 CSharpIndexStatus::Ready => "ready",
+                CSharpIndexStatus::Partial => "partial",
                 CSharpIndexStatus::Error => "error",
                 CSharpIndexStatus::Indexing => "indexing",
             };
             let ts_str = match info.typescript_index {
                 CSharpIndexStatus::None => "none",
                 CSharpIndexStatus::Ready => "ready",
+                CSharpIndexStatus::Partial => "partial",
                 CSharpIndexStatus::Error => "error",
                 CSharpIndexStatus::Indexing => "indexing",
             };
@@ -4082,6 +4141,10 @@ async fn info_handler(
 
     let db_size_human = tui::dir_size_human(&db_path);
 
+    // Durable symbol-index warnings, read fresh from the on-disk meta
+    // (shared with the TUI info overlay so the two cannot drift).
+    let symbol_warnings = state.collect_symbol_warnings(&db_path);
+
     AxumJson(json!({
         "path": db_path.display().to_string(),
         "chunks": chunks,
@@ -4092,6 +4155,9 @@ async fn info_handler(
         "dims": dims,
         "lock": lock,
         "index_age": index_age,
+        // Durable record of a degraded symbol index (see the TUI's C#⚠):
+        // build-environment failures the helper survived during rebuild.
+        "symbol_warnings": symbol_warnings,
         // Is the HNSW graph built and committed? A non-zero `chunks` with
         // `indexed: false` is a searchable-looking but silently dead index:
         // `VectorStore::search` refuses to run without the graph. The cloud
@@ -4252,10 +4318,15 @@ async fn trigger_symbol_rebuild(
             );
             state.end_indexing(&alias_owned, IndexingOwner::Symbol);
             if is_csharp {
+                let (status, detail) = csharp_success_outcome(&summary.index_warnings);
                 state
                     .csharp_index_status
-                    .insert(alias_owned.clone(), CSharpIndexStatus::Ready);
-                state.csharp_index_error.remove(&alias_owned);
+                    .insert(alias_owned.clone(), status);
+                if let Some(detail) = detail {
+                    state.csharp_index_error.insert(alias_owned.clone(), detail);
+                } else {
+                    state.csharp_index_error.remove(&alias_owned);
+                }
 
                 if let Ok(mut cfg) = state.config.write() {
                     cfg.touch_last_scip(&alias_owned, ServeState::now_unix_secs());

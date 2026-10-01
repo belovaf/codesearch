@@ -110,6 +110,21 @@ pub(crate) fn summarize_index_warnings(lines: &[String], cap: usize) -> Vec<Stri
     out
 }
 
+/// The stored form of the summarized warnings: a stand-alone summary entry
+/// leads, because the list rides on every find_impact answer AND the TUI
+/// info panel and must be understandable alone.
+pub(crate) fn index_warnings_stored(entries: &[String]) -> Vec<String> {
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    let mut stored = vec![format!(
+        "The symbol index was built while the C# workspace reported {} distinct failure(s) — cross-project references may be missing from every answer. Fix the underlying build problem (often a dotnet restore) and reindex.",
+        entries.len()
+    )];
+    stored.extend(entries.iter().cloned());
+    stored
+}
+
 /// Route one scip-csharp stderr line into tracing at the right severity.
 /// This is the ONLY sanctioned path for helper stderr: spawn helpers with
 /// `Stdio::piped()` and drain through here — never `Stdio::inherit()`,
@@ -1778,17 +1793,12 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         )?;
         // Index-level completeness warnings from this run — written or
         // cleared on EVERY rebuild (full or incremental) so meta always
-        // describes the newest build. The summary entry leads because the
-        // list rides on every find_impact answer and must stand alone.
-        if index_warnings.is_empty() {
+        // describes the newest build.
+        let stored_warnings = index_warnings_stored(&index_warnings);
+        if stored_warnings.is_empty() {
             meta_db.delete(&mut wtxn, META_INDEX_WARNINGS)?;
         } else {
-            let mut stored = vec![format!(
-                "The symbol index was built while the C# workspace reported {} distinct failure(s) — cross-project references may be missing from every answer. Fix the underlying build problem (often a dotnet restore) and reindex.",
-                index_warnings.len()
-            )];
-            stored.extend(index_warnings.iter().cloned());
-            let json = serde_json::to_string(&stored).unwrap_or_else(|_| "[]".to_string());
+            let json = serde_json::to_string(&stored_warnings).unwrap_or_else(|_| "[]".to_string());
             meta_db.put(&mut wtxn, META_INDEX_WARNINGS, json.as_str())?;
         }
 
@@ -1817,6 +1827,7 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             symbols_indexed: total_symbols,
             references_stored: total_defs, // definitions only; refs resolved lazily
             duration_ms,
+            index_warnings: stored_warnings,
         })
     }
 
