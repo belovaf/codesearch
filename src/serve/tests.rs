@@ -3287,3 +3287,237 @@ async fn stale_eviction_is_scoped_to_the_stale_owner() {
         "an empty owner map must be removed, not left behind"
     );
 }
+
+// ── Always-on symbol indexes (features/always-on-symbol-indexes) ──────────
+
+/// The per-(alias, language) claim must reject a second fresh claim, accept
+/// one per language independently, become claimable after release, and take
+/// over a claim older than the indexing timeout (leaked by a crashed task).
+#[test]
+fn symbol_rebuild_claim_rejects_fresh_and_takes_over_stale() {
+    let state = ServeState::new(ReposConfig::default(), None);
+
+    assert!(
+        state.begin_symbol_rebuild("repo", "csharp"),
+        "first claim must succeed"
+    );
+    assert!(
+        !state.begin_symbol_rebuild("repo", "csharp"),
+        "a second fresh claim must be rejected"
+    );
+    assert!(
+        state.begin_symbol_rebuild("repo", "typescript"),
+        "a different language must claim independently"
+    );
+
+    state.end_symbol_rebuild("repo", "csharp");
+    assert!(
+        state.begin_symbol_rebuild("repo", "csharp"),
+        "a released slot must be claimable again"
+    );
+
+    // Stale takeover: a claim past the indexing timeout is taken over.
+    let max = state.indexing_timeout();
+    state.symbol_rebuild_in_flight.insert(
+        "csharp:stale".to_string(),
+        std::time::Instant::now() - max - std::time::Duration::from_secs(1),
+    );
+    assert!(
+        state.begin_symbol_rebuild("stale", "csharp"),
+        "a stale claim must be taken over"
+    );
+}
+
+/// The generic gate must answer NotApplicable for a repo without the
+/// language's entrypoint (no tsconfig.json) — deterministically, before the
+/// machine-dependent helper check — and route C# through its dedicated
+/// evaluator (.sln check → NoSolutionFile).
+#[test]
+fn evaluate_symbol_rebuild_gates_applicability_before_availability() {
+    // `evaluate_symbol_rebuild` takes `self: &Arc<Self>` (it may be forwarded
+    // to spawn_blocking by callers), so the probe state lives in an Arc.
+    let state = std::sync::Arc::new(ServeState::new(ReposConfig::default(), None));
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join(DB_DIR_NAME);
+
+    assert_eq!(
+        state.evaluate_symbol_rebuild("typescript", "x", tmp.path(), &db),
+        RebuildDecision::NotApplicable,
+        "a repo without tsconfig.json is not applicable, helper or not"
+    );
+    assert_eq!(
+        state.evaluate_symbol_rebuild("csharp", "x", tmp.path(), &db),
+        RebuildDecision::NoSolutionFile,
+        "C# must keep its dedicated .sln-first evaluator"
+    );
+}
+
+/// The find_impact self-heal must no-op quietly for an unknown alias (remote
+/// mounts, typos) and for a registered repo the language does not apply to —
+/// no claim taken, no C# status touched, no panic.
+#[tokio::test]
+async fn heal_missing_symbol_index_noops_outside_its_remit() {
+    // Unknown alias.
+    let state = std::sync::Arc::new(ServeState::new(ReposConfig::default(), None));
+    heal_missing_symbol_index(&state, "ghost", "csharp").await;
+    assert!(
+        state.symbol_rebuild_in_flight.is_empty(),
+        "unknown alias must not take a claim"
+    );
+
+    // Registered alias, non-applicable language (no .sln / tsconfig.json).
+    let (_tmp, _path, bare) = state_with_repo("plainrepo");
+    let state = std::sync::Arc::new(bare);
+    heal_missing_symbol_index(&state, "plainrepo", "csharp").await;
+    heal_missing_symbol_index(&state, "plainrepo", "typescript").await;
+    assert!(
+        state.symbol_rebuild_in_flight.is_empty(),
+        "non-applicable repo must not take a claim"
+    );
+    assert!(
+        !state.csharp_index_status.contains_key("plainrepo"),
+        "non-applicable repo must not flip the C# indicator"
+    );
+}
+
+/// `maybe_rebuild_symbols` on a repo no language applies to must neither
+/// panic nor leave claims behind — with and without force (the force path
+/// skips the gate but trigger_symbol_rebuild still skips non-applicable
+/// repos before claiming).
+#[tokio::test]
+async fn maybe_rebuild_symbols_skips_non_applicable_repo_under_force() {
+    let (_tmp, _path, bare) = state_with_repo("plainrepo2");
+    let state = std::sync::Arc::new(bare);
+    let path = state.config.read().unwrap().resolve("plainrepo2").unwrap();
+    let db = path.join(DB_DIR_NAME);
+    maybe_rebuild_symbols("plainrepo2", &path, &db, &state, true).await;
+    assert!(
+        state.symbol_rebuild_in_flight.is_empty(),
+        "force must not claim a slot for a non-applicable repo"
+    );
+}
+
+/// A dummy `scip-csharp` helper at the env-override path: available for
+/// detection, fails on execution — which flips the C# status to Error while
+/// proving a rebuild was actually attempted. The helper file lives in
+/// `root`, which the caller keeps alive via its TempDir.
+fn dummy_csharp_helper(root: &std::path::Path) -> crate::testing::EnvRestore {
+    let helper = root.join(if cfg!(windows) {
+        "scip-csharp.exe"
+    } else {
+        "scip-csharp"
+    });
+    std::fs::write(&helper, b"dummy").expect("dummy helper file");
+    crate::testing::EnvRestore::set(&[(
+        crate::constants::SCIP_CSHARP_HELPER_ENV,
+        helper.to_string_lossy().as_ref(),
+    )])
+}
+
+/// Phase-2 composition wiring: a registered repo whose language applies and
+/// whose index is missing must flow gate → queue → trigger end-to-end. The
+/// dummy helper makes the rebuild FAIL, observable as C# status Error once
+/// `run_phase_2_symbols` completes — None would mean the candidate was never
+/// queued (the composition gap this test pins).
+#[tokio::test]
+#[serial]
+async fn run_phase_2_symbols_wires_candidate_through_to_trigger() {
+    let helper_root = tempfile::tempdir().unwrap();
+    let _env = dummy_csharp_helper(helper_root.path());
+
+    let (_tmp, repo_path, bare) = state_with_repo("phase2repo");
+    std::fs::write(
+        repo_path.join("test.sln"),
+        b"Microsoft Visual Studio Solution File",
+    )
+    .unwrap();
+
+    let state = std::sync::Arc::new(bare);
+    state.run_phase_2_symbols().await;
+
+    assert_eq!(
+        state
+            .csharp_index_status
+            .get("phase2repo")
+            .map(|e| *e.value()),
+        Some(CSharpIndexStatus::Error),
+        "the missing C# index must be queued and the rebuild attempted \
+         (dummy helper → Error); None means never queued"
+    );
+    assert!(
+        state.symbol_rebuild_in_flight.is_empty(),
+        "the claim must be released after the failed rebuild"
+    );
+}
+
+/// The serve-mode find_impact self-heal spawn must reach
+/// `trigger_symbol_rebuild` for a registered, applicable repo: after the
+/// warned empty answer, the C# status eventually flips to Error (dummy
+/// helper) in the serve state the heal captured.
+#[tokio::test]
+#[serial]
+async fn find_impact_self_heal_runs_the_rebuild_in_serve_mode() {
+    let helper_root = tempfile::tempdir().unwrap();
+    let _env = dummy_csharp_helper(helper_root.path());
+
+    let (_tmp, repo_path, bare) = state_with_repo("healrepo");
+    std::fs::write(
+        repo_path.join("test.sln"),
+        b"Microsoft Visual Studio Solution File",
+    )
+    .unwrap();
+    // The routing layer requires an existing index dir before it will open
+    // the repo (seed like the find_impact fixtures do).
+    let db = repo_path.join(DB_DIR_NAME);
+    std::fs::create_dir_all(&db).unwrap();
+    std::fs::write(
+        db.join("metadata.json"),
+        r#"{"schema_version":1,"dimensions":2,"model_short_name":"minilm-l6-q"}"#,
+    )
+    .unwrap();
+    let state = std::sync::Arc::new(bare);
+
+    let request = crate::mcp::types::FindImpactRequest {
+        symbol_name: Some("ResolveLinkedActivityAsync".to_string()),
+        file: None,
+        line: None,
+        symbol_key: None,
+        language: Some("csharp".to_string()),
+        project: Some("healrepo".to_string()),
+        group: None,
+    };
+    // The REST mirror builds its own serve-mode service from the state —
+    // the same path the MCP tool takes for a project-scoped query.
+    let v = crate::mcp::rest_find_impact_handler(
+        axum::extract::State(state.clone()),
+        axum::Json(request),
+    )
+    .await
+    .expect("rest mirror result")
+    .0;
+    let out = v.to_string();
+    assert!(
+        v["warnings"]
+            .as_array()
+            .is_some_and(|w| !w.is_empty() && w[0].as_str().is_some_and(|s| s.contains("UNKNOWN"))),
+        "the never-built index answer must carry the UNKNOWN warning, got: {out}"
+    );
+
+    // The detached heal task runs the rebuild (dummy helper → Error).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        if state
+            .csharp_index_status
+            .get("healrepo")
+            .map(|e| *e.value())
+            == Some(CSharpIndexStatus::Error)
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the self-heal never flipped the C# status — spawn branch not wired"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}

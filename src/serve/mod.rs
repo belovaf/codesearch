@@ -344,6 +344,12 @@ pub(crate) struct ServeState {
     /// Per-repo C# symbol index last error message (set when status is Error, cleared on success).
     /// Wrapped in `Arc` for the same reason as `csharp_index_status`.
     csharp_index_error: Arc<DashMap<String, String>>,
+    /// Symbol rebuilds in flight, keyed `"{lang}:{alias}"` → claim Instant.
+    /// Guards against double-triggered full rebuilds (find_impact self-heal
+    /// racing phase-2/reindex/watcher): two concurrent rebuilds interleave
+    /// their LMDB clear/write passes. Stale claims self-heal past the
+    /// indexing timeout, like `active_reindexes` markers.
+    symbol_rebuild_in_flight: DashMap<String, std::time::Instant>,
     /// Debounced deadline for persisting repos config metadata (unix millis).
     persist_deadline_unix_ms: AtomicU64,
     /// Ensures only one debounce worker task runs.
@@ -375,6 +381,9 @@ enum RebuildDecision {
     Fresh,
     /// No `.sln` file found; C# indexing is not applicable for this repo.
     NoSolutionFile,
+    /// The repo lacks this language's entrypoint (e.g. no `tsconfig.json`) —
+    /// the generic per-language gate's counterpart of `NoSolutionFile`.
+    NotApplicable,
     /// The scip-csharp helper binary is not available.
     HelperUnavailable,
     /// An indexing task for this alias is already running.
@@ -425,6 +434,7 @@ impl ServeState {
             tool_call_counts: DashMap::new(),
             csharp_index_status: Arc::new(DashMap::new()),
             csharp_index_error: Arc::new(DashMap::new()),
+            symbol_rebuild_in_flight: DashMap::new(),
             persist_deadline_unix_ms: AtomicU64::new(0),
             persist_worker_started: AtomicBool::new(false),
             #[cfg(test)]
@@ -1223,6 +1233,73 @@ impl ServeState {
         }
     }
 
+    /// Claim the `(alias, language)` symbol-rebuild slot. Returns `false`
+    /// when a fresh claim exists (a rebuild is genuinely running); a claim
+    /// older than the indexing timeout is taken over (leaked by a crashed
+    /// task, same self-heal as [`Self::begin_indexing`]).
+    fn begin_symbol_rebuild(&self, alias: &str, lang: &str) -> bool {
+        let now = std::time::Instant::now();
+        let max = self.indexing_timeout();
+        let key = format!("{lang}:{alias}");
+        match self.symbol_rebuild_in_flight.entry(key) {
+            dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
+                if now.duration_since(*occupied.get()) < max {
+                    return false;
+                }
+                *occupied.get_mut() = now;
+                true
+            }
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                vacant.insert(now);
+                true
+            }
+        }
+    }
+
+    /// Release the `(alias, language)` symbol-rebuild slot claimed by
+    /// [`Self::begin_symbol_rebuild`].
+    fn end_symbol_rebuild(&self, alias: &str, lang: &str) {
+        self.symbol_rebuild_in_flight
+            .remove(&format!("{lang}:{alias}"));
+    }
+
+    /// Generic per-language rebuild gate. C# keeps its dedicated evaluator
+    /// (last_scip/last_changed bookkeeping, TUI status map); every other
+    /// language rebuilds only a *missing* index — drift stays
+    /// watcher/branch-change driven, mirroring the deliberate no-thrash
+    /// policy documented on `SymbolIndexer::index_head_sha`.
+    fn evaluate_symbol_rebuild(
+        self: &Arc<Self>,
+        lang: &str,
+        alias: &str,
+        repo_path: &Path,
+        db_path: &Path,
+    ) -> RebuildDecision {
+        if lang.eq_ignore_ascii_case(LANG_CSHARP) {
+            return self.evaluate_csharp_rebuild(alias, repo_path, db_path);
+        }
+        let Some(indexer) = self.symbol_registry.get(lang) else {
+            return RebuildDecision::HelperUnavailable;
+        };
+        // Applicability before availability: the entrypoint check is cheap and
+        // deterministic (mirrors `evaluate_csharp_rebuild`'s .sln-first order),
+        // while helper availability depends on the machine.
+        if !indexer.applies_to(repo_path) {
+            return RebuildDecision::NotApplicable;
+        }
+        if !indexer.is_available() {
+            return RebuildDecision::HelperUnavailable;
+        }
+        if !self.begin_symbol_rebuild(alias, lang) {
+            return RebuildDecision::AlreadyInFlight;
+        }
+        self.end_symbol_rebuild(alias, lang);
+        if !indexer.has_index(db_path) {
+            return RebuildDecision::NoIndex;
+        }
+        RebuildDecision::Fresh
+    }
+
     pub(crate) fn schedule_persist_repos_config(self: &Arc<Self>) {
         let deadline = Self::now_unix_millis() + (PERSIST_DEBOUNCE_SECS * 1000);
         self.persist_deadline_unix_ms
@@ -1411,10 +1488,15 @@ impl ServeState {
         }
     }
 
-    /// Phase 2: semaphore-bounded concurrent C# SCIP rebuilds, sorted by recency.
-    pub(crate) async fn run_phase_2_csharp_scip(self: &Arc<Self>) {
+    /// Phase 2: semaphore-bounded concurrent SCIP rebuilds across all
+    /// installed languages, sorted by recency. C# keeps its dedicated gate
+    /// (`evaluate_csharp_rebuild`); other languages rebuild only a missing
+    /// index (no-thrash: drift is watcher/branch-change driven).
+    pub(crate) async fn run_phase_2_symbols(self: &Arc<Self>) {
         let aliases = self.aliases();
-        let mut candidates: Vec<(String, i64)> = Vec::new();
+        let langs = self.symbol_registry.installed_languages();
+        // (alias, lang, last_changed)
+        let mut candidates: Vec<(String, String, i64)> = Vec::new();
 
         for alias in &aliases {
             let path = match self.config.read().ok().and_then(|c| c.resolve(alias)) {
@@ -1422,70 +1504,75 @@ impl ServeState {
                 None => continue,
             };
             let db_path = path.join(DB_DIR_NAME);
-            // evaluate_csharp_rebuild may spawn a git subprocess and walk the
-            // filesystem — offload to the blocking pool so the async runtime
-            // stays responsive while processing all candidates.
-            let state2 = self.clone();
-            let alias2 = alias.clone();
-            let path2 = path.clone();
-            let db_path2 = db_path.clone();
-            let decision = match tokio::task::spawn_blocking(move || {
-                state2.evaluate_csharp_rebuild(&alias2, &path2, &db_path2)
-            })
-            .await
-            {
-                Ok(d) => d,
-                Err(e) => {
-                    warn!(
-                        "phase-2: evaluate_csharp_rebuild panicked for '{}': {:?}",
-                        alias, e
-                    );
+            for lang in &langs {
+                // evaluate_symbol_rebuild may spawn a git subprocess and walk
+                // the filesystem — offload to the blocking pool so the async
+                // runtime stays responsive while processing all candidates.
+                let state2 = self.clone();
+                let alias2 = alias.clone();
+                let lang2 = lang.clone();
+                let path2 = path.clone();
+                let db_path2 = db_path.clone();
+                let decision = match tokio::task::spawn_blocking(move || {
+                    state2.evaluate_symbol_rebuild(&lang2, &alias2, &path2, &db_path2)
+                })
+                .await
+                {
+                    Ok(d) => d,
+                    Err(e) => {
+                        warn!(
+                            "phase-2: symbol evaluate panicked for '{}' ({}): {:?}",
+                            alias, lang, e
+                        );
+                        continue;
+                    }
+                };
+                if !decision.needs_rebuild() {
+                    // A fresh C# index flips the TUI C# indicator to Ready;
+                    // other languages have no status map, nothing to update.
+                    if decision == RebuildDecision::Fresh && lang.as_str() == LANG_CSHARP {
+                        let mut status = self
+                            .csharp_index_status
+                            .get(alias)
+                            .map(|e| *e.value())
+                            .unwrap_or(CSharpIndexStatus::None);
+                        if matches!(status, CSharpIndexStatus::None) {
+                            status = CSharpIndexStatus::Ready;
+                        }
+                        self.csharp_index_status.insert(alias.to_string(), status);
+                    }
+                    info!("phase-2: skip '{}' ({}) — {:?}", alias, lang, decision);
                     continue;
                 }
-            };
-            if !decision.needs_rebuild() {
-                // If the SCIP index exists and is fresh, mark C# status as Ready
-                // so the TUI shows the C# indicator (e.g. "C#·") instead of None.
-                if decision == RebuildDecision::Fresh {
-                    let mut status = self
-                        .csharp_index_status
-                        .get(alias)
-                        .map(|e| *e.value())
-                        .unwrap_or(CSharpIndexStatus::None);
-                    if matches!(status, CSharpIndexStatus::None) {
-                        status = CSharpIndexStatus::Ready;
-                    }
-                    self.csharp_index_status.insert(alias.to_string(), status);
-                }
-                info!("phase-2: skip '{}' — {:?}", alias, decision);
-                continue;
+                let last_changed = self
+                    .config
+                    .read()
+                    .ok()
+                    .and_then(|c| c.meta(alias).last_changed_unix)
+                    .unwrap_or(0);
+                info!(
+                    "phase-2: queued '{}' ({}) — {:?} (last_changed={})",
+                    alias, lang, decision, last_changed
+                );
+                candidates.push((alias.clone(), lang.clone(), last_changed));
             }
-            let last_changed = self
-                .config
-                .read()
-                .ok()
-                .and_then(|c| c.meta(alias).last_changed_unix)
-                .unwrap_or(0);
-            info!(
-                "phase-2: queued '{}' — {:?} (last_changed={})",
-                alias, decision, last_changed
-            );
-            candidates.push((alias.clone(), last_changed));
         }
 
-        candidates.sort_by_key(|b| std::cmp::Reverse(b.1));
+        candidates.sort_by_key(|c| std::cmp::Reverse(c.2));
         if candidates.is_empty() {
             info!("phase-2 complete: 0 candidates");
             return;
         }
 
-        // Pre-mark all queued candidates as C# Indexing so the TUI C# indicator
+        // Pre-mark queued C# candidates as Indexing so the TUI C# indicator
         // reflects pending rebuilds immediately, even before each repo acquires
         // its semaphore slot. trigger_symbol_rebuild will overwrite this with the
         // same value (no-op) and eventually with Ready or Error on completion.
-        for (alias, _) in &candidates {
-            self.csharp_index_status
-                .insert(alias.clone(), CSharpIndexStatus::Indexing);
+        for (alias, lang, _) in &candidates {
+            if lang.as_str() == LANG_CSHARP {
+                self.csharp_index_status
+                    .insert(alias.clone(), CSharpIndexStatus::Indexing);
+            }
         }
 
         let concurrency = Self::csharp_scip_concurrency();
@@ -1497,7 +1584,7 @@ impl ServeState {
         let sem = Arc::new(Semaphore::new(concurrency));
         let mut handles = Vec::with_capacity(candidates.len());
 
-        for (alias, _) in candidates {
+        for (alias, lang, _) in candidates {
             let sem = sem.clone();
             let state = self.clone();
             handles.push(tokio::spawn(async move {
@@ -1505,7 +1592,7 @@ impl ServeState {
                     Ok(p) => p,
                     Err(_) => return,
                 };
-                info!("phase-2: starting '{}'", alias);
+                info!("phase-2: starting '{}' ({})", alias, lang);
                 let path = match state.config.read().ok().and_then(|c| c.resolve(&alias)) {
                     Some(p) => p,
                     None => {
@@ -1526,7 +1613,7 @@ impl ServeState {
                     return;
                 }
                 let db_path = path.join(DB_DIR_NAME);
-                trigger_symbol_rebuild(&alias, &path, &db_path, &state).await;
+                trigger_symbol_rebuild(&alias, &path, &db_path, &state, &lang).await;
                 drop(permit);
             }));
         }
@@ -4071,38 +4158,59 @@ async fn doctor_handler(
     AxumJson(json!({ "results": results })).into_response()
 }
 
-/// Trigger a symbol index rebuild for a repo (C# etc.).
+/// Trigger a symbol index rebuild for a repo in one language (C#, TypeScript).
 ///
-/// Reuses the shared `SymbolIndexerRegistry` from `ServeState`, looks up the C# indexer,
-/// and runs `rebuild()` in a blocking task. Updates the C# index status on success/failure.
+/// Reuses the shared `SymbolIndexerRegistry` from `ServeState`, looks up the
+/// indexer for `lang`, and runs `rebuild()` in a blocking task. C#-only
+/// bookkeeping (TUI status/error maps, `last_scip` timestamp) stays gated on
+/// the language; `IndexingOwner::Symbol` markers apply to every language.
+///
+/// A per-`(alias, language)` in-flight slot prevents two concurrent full
+/// rebuilds from interleaving their LMDB clear/write passes (find_impact
+/// self-heal racing phase-2/reindex/watcher). Languages for one alias run
+/// sequentially at multi-language call sites (see `maybe_rebuild_symbols`) —
+/// the `IndexingOwner::Symbol` marker is not language-scoped.
 async fn trigger_symbol_rebuild(
     alias: &str,
     project_path: &Path,
     db_path: &Path,
     state: &Arc<ServeState>,
+    lang: &str,
 ) {
+    let is_csharp = lang.eq_ignore_ascii_case(LANG_CSHARP);
     // Skip non-applicable repos BEFORE touching status — otherwise the TUI
     // would flip C#-indicator red on Rust/Python repos that simply have no
-    // .sln. The phase-2 gate (`evaluate_csharp_rebuild`) already filters
+    // .sln. The phase-2 gate (`evaluate_symbol_rebuild`) already filters
     // these out, but other callers (POST /reindex?symbols=true,
-    // .cs watcher debounce, future paths) bypass that gate.
+    // .cs watcher debounce, find_impact self-heal) bypass that gate.
     let applies = state
         .symbol_registry
-        .get(LANG_CSHARP)
+        .get(lang)
         .map(|i| i.applies_to(project_path))
         .unwrap_or(false);
     if !applies {
         tracing::info!(
-            "🔬 symbol reindex skipped for '{}': not applicable (no .sln)",
+            "🔬 symbol reindex skipped for '{}': not applicable (no .sln / tsconfig.json)",
             alias
         );
         return;
     }
 
-    tracing::info!("🔬 symbol reindex triggered for '{}'", alias);
-    state
-        .csharp_index_status
-        .insert(alias.to_string(), CSharpIndexStatus::Indexing);
+    if !state.begin_symbol_rebuild(alias, lang) {
+        tracing::info!(
+            "🔬 symbol reindex skipped for '{}' ({}): already in flight",
+            alias,
+            lang
+        );
+        return;
+    }
+
+    tracing::info!("🔬 symbol reindex triggered for '{}' ({})", alias, lang);
+    if is_csharp {
+        state
+            .csharp_index_status
+            .insert(alias.to_string(), CSharpIndexStatus::Indexing);
+    }
     // Mark as actively indexing so the TUI status column shows "Indexing"
     // (not just the C# indicator). This mirrors what reindex_handler does.
     //
@@ -4110,17 +4218,25 @@ async fn trigger_symbol_rebuild(
     // for the same alias simultaneously, each path ends only its own marker,
     // so neither can flip the TUI back to Warm/Open while the other still
     // runs. (Stale entries from a crashed task self-heal via `is_indexing`.)
-    state.begin_indexing(alias, IndexingOwner::Symbol);
+    // The return value is deliberately ignored: nested callers (the reindex
+    // and add-repo background tasks) legitimately hold the alias's Reindex
+    // marker while triggering this.
+    let _ = state.begin_indexing(alias, IndexingOwner::Symbol);
     let rp = project_path.to_path_buf();
     let dp = db_path.to_path_buf();
     let alias_owned = alias.to_string();
+    let lang_owned = lang.to_string();
     let registry = state.symbol_registry.clone();
     match tokio::task::spawn_blocking(move || {
-        let Some(indexer) = registry.get(LANG_CSHARP) else {
-            return Err(anyhow::anyhow!("No C# symbol indexer registered"));
+        let Some(indexer) = registry.get(&lang_owned) else {
+            return Err(anyhow::anyhow!(
+                "No symbol indexer registered for '{lang_owned}'"
+            ));
         };
         if !indexer.is_available() {
-            return Err(anyhow::anyhow!("scip-csharp helper not available"));
+            return Err(anyhow::anyhow!(
+                "symbol helper for '{lang_owned}' not available"
+            ));
         }
         indexer.rebuild(&rp, &dp, RebuildScope::Full)
     })
@@ -4135,15 +4251,17 @@ async fn trigger_symbol_rebuild(
                 summary.duration_ms
             );
             state.end_indexing(&alias_owned, IndexingOwner::Symbol);
-            state
-                .csharp_index_status
-                .insert(alias_owned.clone(), CSharpIndexStatus::Ready);
-            state.csharp_index_error.remove(&alias_owned);
+            if is_csharp {
+                state
+                    .csharp_index_status
+                    .insert(alias_owned.clone(), CSharpIndexStatus::Ready);
+                state.csharp_index_error.remove(&alias_owned);
 
-            if let Ok(mut cfg) = state.config.write() {
-                cfg.touch_last_scip(&alias_owned, ServeState::now_unix_secs());
+                if let Ok(mut cfg) = state.config.write() {
+                    cfg.touch_last_scip(&alias_owned, ServeState::now_unix_secs());
+                }
+                state.schedule_persist_repos_config();
             }
-            state.schedule_persist_repos_config();
         }
         Ok(Err(e)) => {
             // `{:#}` — the whole chain, not just the outermost context. The
@@ -4151,9 +4269,11 @@ async fn trigger_symbol_rebuild(
             // would hide the `MDB_*` code the classifier below matches on.
             let msg = format!("{e:#}");
             state.end_indexing(&alias_owned, IndexingOwner::Symbol);
-            state
-                .csharp_index_error
-                .insert(alias_owned.clone(), msg.clone());
+            if is_csharp {
+                state
+                    .csharp_index_error
+                    .insert(alias_owned.clone(), msg.clone());
+            }
             if ServeState::is_lmdb_format_corruption(&msg)
                 && state.enqueue_format_recovery(&alias_owned)
             {
@@ -4165,9 +4285,11 @@ async fn trigger_symbol_rebuild(
                 );
                 // Recovery owns the outcome from here: show in-progress rather
                 // than Error; it flips to Ready on success or Error on failure.
-                state
-                    .csharp_index_status
-                    .insert(alias_owned, CSharpIndexStatus::Indexing);
+                if is_csharp {
+                    state
+                        .csharp_index_status
+                        .insert(alias_owned, CSharpIndexStatus::Indexing);
+                }
             } else if ServeState::is_lmdb_format_corruption(&msg) {
                 // A wipe already happened for this alias in this process, so the
                 // data was written by the running binary: the error is write-side
@@ -4179,14 +4301,18 @@ async fn trigger_symbol_rebuild(
                     alias_owned,
                     msg
                 );
-                state
-                    .csharp_index_status
-                    .insert(alias_owned, CSharpIndexStatus::Error);
+                if is_csharp {
+                    state
+                        .csharp_index_status
+                        .insert(alias_owned, CSharpIndexStatus::Error);
+                }
             } else {
                 tracing::error!("❌ Symbol rebuild failed for '{}': {}", alias_owned, msg);
-                state
-                    .csharp_index_status
-                    .insert(alias_owned, CSharpIndexStatus::Error);
+                if is_csharp {
+                    state
+                        .csharp_index_status
+                        .insert(alias_owned, CSharpIndexStatus::Error);
+                }
             }
         }
         Err(e) => {
@@ -4196,14 +4322,107 @@ async fn trigger_symbol_rebuild(
                 e
             );
             state.end_indexing(&alias_owned, IndexingOwner::Symbol);
-            state
-                .csharp_index_error
-                .insert(alias_owned.clone(), format!("Task panicked: {}", e));
-            state
-                .csharp_index_status
-                .insert(alias_owned, CSharpIndexStatus::Error);
+            if is_csharp {
+                state
+                    .csharp_index_error
+                    .insert(alias_owned.clone(), format!("Task panicked: {}", e));
+                state
+                    .csharp_index_status
+                    .insert(alias_owned, CSharpIndexStatus::Error);
+            }
         }
     }
+    state.end_symbol_rebuild(alias, lang);
+}
+
+/// Evaluate every installed symbol language for `alias` and rebuild the ones
+/// whose gate says so. `force` (POST /reindex?symbols=true) bypasses the
+/// gate, preserving the old unconditional-rebuild behaviour.
+///
+/// Sequential per language: `IndexingOwner::Symbol` is not language-scoped,
+/// so parallel languages would collide on the marker. Called from the
+/// reindex and add-repo background tasks, where the alias already holds a
+/// Reindex owner marker — `trigger_symbol_rebuild`'s own marker insert is
+/// additive, not a guard, so nesting is safe.
+async fn maybe_rebuild_symbols(
+    alias: &str,
+    project_path: &Path,
+    db_path: &Path,
+    state: &Arc<ServeState>,
+    force: bool,
+) {
+    let langs = state.symbol_registry.installed_languages();
+    for lang in langs {
+        let decision = if force {
+            RebuildDecision::ChangedSinceLastBuild
+        } else {
+            // evaluate may spawn a git subprocess — offload like phase-2.
+            let st = Arc::clone(state);
+            let a = alias.to_string();
+            let l = lang.clone();
+            let p = project_path.to_path_buf();
+            let d = db_path.to_path_buf();
+            match tokio::task::spawn_blocking(move || st.evaluate_symbol_rebuild(&l, &a, &p, &d))
+                .await
+            {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!(
+                        "symbol evaluate panicked for '{}' ({}): {:?}",
+                        alias, lang, e
+                    );
+                    continue;
+                }
+            }
+        };
+        if decision.needs_rebuild() {
+            trigger_symbol_rebuild(alias, project_path, db_path, state, &lang).await;
+        } else {
+            info!("symbols fresh for '{}' ({}) — {:?}", alias, lang, decision);
+        }
+    }
+}
+
+/// Fire-and-forget self-heal invoked by `find_impact` when the target index
+/// does not exist: rebuild exactly that language's *missing* index — never on
+/// drift (reindexing per query would thrash; see
+/// `SymbolIndexer::index_head_sha`). The alias is re-resolved from the serve
+/// config so remote-mounted projects (`peer/name`) are never healed locally.
+pub(crate) async fn heal_missing_symbol_index(state: &Arc<ServeState>, alias: &str, lang: &str) {
+    let Some(path) = state.config.read().ok().and_then(|c| c.resolve(alias)) else {
+        return;
+    };
+    if !path.exists() {
+        return;
+    }
+    let db_path = path.join(DB_DIR_NAME);
+    // evaluate may spawn a git subprocess (C# last_changed bootstrap) —
+    // offload so the heal task never blocks an async worker.
+    let st = Arc::clone(state);
+    let a = alias.to_string();
+    let l = lang.to_string();
+    let p = path.clone();
+    let d = db_path.clone();
+    let decision =
+        match tokio::task::spawn_blocking(move || st.evaluate_symbol_rebuild(&l, &a, &p, &d)).await
+        {
+            Ok(decision) => decision,
+            Err(e) => {
+                warn!(
+                    "self-heal evaluate panicked for '{}' ({}): {:?}",
+                    alias, lang, e
+                );
+                return;
+            }
+        };
+    if decision != RebuildDecision::NoIndex {
+        return;
+    }
+    info!(
+        "🔬 self-heal: '{}' has no {} symbol index — rebuilding in background (triggered by find_impact)",
+        alias, lang
+    );
+    trigger_symbol_rebuild(alias, &path, &db_path, state, lang).await;
 }
 
 /// Reload repos config handler: POST /reload
@@ -4334,6 +4553,8 @@ async fn reindex_handler(
     let guard_alias = alias_bg.clone();
     let guard_state = state.clone();
 
+    // `symbols=true` forces a symbol rebuild; without it the rebuild is
+    // gate-driven (missing/stale indexes are still healed).
     let do_symbols = symbols;
 
     if force {
@@ -4459,10 +4680,9 @@ async fn reindex_handler(
             // 3. Restart FSW with fresh IndexManager.
             g_state.restart_fsw(&g_alias, stores).await;
 
-            // 4. Optional symbol index rebuild
-            if do_symbols {
-                trigger_symbol_rebuild(&alias_bg, &project_path, &db_path, &g_state).await;
-            }
+            // 4. Symbol index rebuild — gate-driven for every installed
+            // language; `symbols=true` forces it (previous behaviour).
+            maybe_rebuild_symbols(&alias_bg, &project_path, &db_path, &g_state, do_symbols).await;
 
             g_state.end_indexing(&g_alias, IndexingOwner::Reindex);
         });
@@ -4533,10 +4753,9 @@ async fn reindex_handler(
                 return;
             }
 
-            // Optional symbol index rebuild
-            if do_symbols {
-                trigger_symbol_rebuild(&alias_bg, &project_path, &db_path, &g_state).await;
-            }
+            // Symbol index rebuild — gate-driven for every installed
+            // language; `symbols=true` forces it (previous behaviour).
+            maybe_rebuild_symbols(&alias_bg, &project_path, &db_path, &g_state, do_symbols).await;
 
             g_state.end_indexing(&g_alias, IndexingOwner::Reindex);
         });
@@ -4920,6 +5139,11 @@ async fn add_repo_handler(
 
         // Start FSW and transition to proper Write state with IndexManager
         state_bg.restart_fsw(&alias_bg, stores).await;
+
+        // Phase-2 equivalence for runtime adds: a repo registered while serve
+        // runs never sees the startup symbol pass, so its symbol indexes would
+        // not exist until a restart — build them now (gate-driven).
+        maybe_rebuild_symbols(&alias_bg, &project_path, &db_path, &state_bg, false).await;
 
         state_bg.end_indexing(&alias_bg, IndexingOwner::Reindex);
         tracing::info!("Repo '{}' fully indexed and ready", alias_bg);
@@ -5901,7 +6125,7 @@ pub async fn run_serve(
                 warn!("reconcile: spawn_blocking panicked: {:?}", e);
             }
             phase_state.run_phase_1_warmup_all().await;
-            phase_state.run_phase_2_csharp_scip().await;
+            phase_state.run_phase_2_symbols().await;
             phase_state.run_phase_3_prewarm().await;
         });
     }

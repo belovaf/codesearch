@@ -93,6 +93,16 @@ fn dedupe_references(
     out
 }
 
+/// Caller-facing warning for a find_impact answer against a project whose
+/// symbol index was never built. The empty reference list such an answer
+/// carries means UNKNOWN — stamping this on the payload is what keeps it from
+/// passing for "no callers" while the self-heal rebuild runs.
+pub(crate) fn missing_index_warning(lang: &str) -> String {
+    format!(
+        "No {lang} symbol index exists for this project — an empty reference list means UNKNOWN, not 'no references'. A background rebuild was started; retry this call once it completes."
+    )
+}
+
 #[tool_router(router = find_impact_router, vis = "pub(crate)")]
 impl CodesearchService {
     /// Symbol impact analysis — returns transitive call-sites of a symbol with file/line precision.
@@ -249,6 +259,36 @@ impl CodesearchService {
             )]));
         }
 
+        // Self-heal + honesty: a project whose symbol index was never built
+        // answers EVERY query with NotFound/empty references — visually
+        // identical to "no callers", the exact trap that reads as "safe to
+        // remove" when it is not. Start a background rebuild (serve mode
+        // only) whenever the definitions index is absent; the *warning*
+        // below rides only on answers that actually come back empty
+        // (NotFound / resolution failure) — a successful resolution proves
+        // usable data exists and keeps its payload to the persisted
+        // warnings channel. Drift (index_head_sha vs current) is
+        // deliberately NOT healed — reindexing on every branch switch would
+        // thrash (see `SymbolIndexer::index_head_sha`).
+        let index_missing = !indexer.has_index(&db_path);
+        let heal_warning: Vec<String> = if index_missing {
+            vec![missing_index_warning(indexer.language())]
+        } else {
+            Vec::new()
+        };
+        if index_missing {
+            if let (Some(ref serve_state), Some(ref alias)) =
+                (&self.serve_state, &ctx.project_alias)
+            {
+                let st = std::sync::Arc::clone(serve_state);
+                let alias_heal = alias.clone();
+                let lang_heal = indexer.language().to_string();
+                tokio::spawn(async move {
+                    crate::serve::heal_missing_symbol_index(&st, &alias_heal, &lang_heal).await;
+                });
+            }
+        }
+
         // Perform the lookup under an internal wall-clock budget.
         //
         // `find_references_for_key` may invoke `scip-csharp find-refs` on a cache miss
@@ -367,10 +407,15 @@ impl CodesearchService {
 
         let canonical = match resolution {
             Err(e) => {
-                let failure = crate::symbols::SymbolLookupFailure::classify(
+                let mut failure = crate::symbols::SymbolLookupFailure::classify(
                     format!("{e:#}"),
                     indexer.index_age(&db_path),
                 );
+                if index_missing {
+                    failure.hint_for_agent.push_str(
+                        " A background rebuild of the missing index was started — retry this call once it completes.",
+                    );
+                }
                 let json =
                     serde_json::to_string(&failure).unwrap_or_else(|_| failure.error.clone());
                 return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
@@ -406,8 +451,10 @@ impl CodesearchService {
             }
             Ok(crate::symbols::KeyMatch::NotFound) => {
                 // Preserve the historical contract for fuzzy queries: an
-                // unresolvable name/position answers empty references.
-                let impact = build_impact(Vec::new(), None, Vec::new());
+                // unresolvable name/position answers empty references. With a
+                // missing index that answer also carries the self-heal
+                // warning — empty must not pass for "no callers".
+                let impact = build_impact(Vec::new(), None, heal_warning);
                 let json = serde_json::to_string(&impact).unwrap_or_else(|_| "{}".to_string());
                 return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
             }

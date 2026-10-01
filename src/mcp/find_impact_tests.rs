@@ -7,7 +7,10 @@
 //! resolution is tested separately against `resolve_find_impact_budget_secs`
 //! with `#[serial]` + `EnvRestore` per the repo rule for env mutation.
 
-use super::{find_impact_with_budget, resolve_find_impact_budget_secs, ImpactLookupOutcome};
+use super::{
+    find_impact_with_budget, missing_index_warning, resolve_find_impact_budget_secs,
+    ImpactLookupOutcome,
+};
 use crate::constants::{DEFAULT_FIND_IMPACT_BUDGET_SECS, FIND_IMPACT_BUDGET_SECS_ENV};
 use crate::symbols::{SymbolLookupBusy, SymbolReference};
 use std::path::PathBuf;
@@ -809,5 +812,65 @@ async fn clean_resolved_answer_omits_the_warnings_field() {
     assert!(
         v.get("warnings").is_none(),
         "a clean answer must OMIT warnings (skip_serializing_if), got: {out}"
+    );
+}
+
+/// The missing-index warning is what keeps a never-built symbol index's
+/// empty reference list from passing for "no callers": it must name the
+/// language, state UNKNOWN explicitly, and tell the caller to retry after
+/// the background rebuild.
+#[test]
+fn missing_index_warning_names_language_and_marks_answer_unknown() {
+    let warning = missing_index_warning("csharp");
+    assert!(
+        warning.contains("csharp"),
+        "must name the language, got: {warning}"
+    );
+    assert!(
+        warning.contains("UNKNOWN"),
+        "must mark the empty list as UNKNOWN, got: {warning}"
+    );
+    assert!(
+        warning.contains("retry"),
+        "must tell the caller to retry after the rebuild, got: {warning}"
+    );
+}
+
+/// A never-built index must not answer "no references" silently: the empty
+/// NotFound answer carries the self-heal warning. Fails without the fix —
+/// the pre-fix answer is byte-identical to a genuine "no callers", the exact
+/// trap that reads as "safe to remove" (observed live on a runtime-registered
+/// worktree whose SCIP index was never built).
+#[tokio::test]
+#[serial_test::serial]
+async fn never_built_index_warns_on_the_empty_answer() {
+    let helper_root = tempfile::tempdir().unwrap();
+    let _guard = make_helper_available(&helper_root);
+    // No fixture population: a valid-but-empty store — neither symbols nor a
+    // rebuild timestamp. This is the never-built state.
+    let (service, _root) = build_service();
+
+    let out = tool_text(
+        &service,
+        FindImpactRequest {
+            symbol_name: Some("ResolveLinkedActivityAsync".to_string()),
+            ..find_impact_request()
+        },
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(
+        v["references"].as_array().is_some_and(|a| a.is_empty()),
+        "the never-built index answers with empty references, got: {out}"
+    );
+    let warnings = v["warnings"].as_array().expect("self-heal warning present");
+    assert_eq!(
+        warnings.len(),
+        1,
+        "exactly the missing-index warning, got: {out}"
+    );
+    assert!(
+        warnings[0].as_str().is_some_and(|w| w.contains("UNKNOWN")),
+        "the warning must mark the answer UNKNOWN, got: {out}"
     );
 }
