@@ -6108,7 +6108,7 @@ pub async fn run_serve(
 
     // ── Startup phase orchestration ──
     // Phase 1 warms all repos sequentially (text/vector ready).
-    // Phase 2 runs gated C# SCIP rebuilds ordered by last_changed.
+    // Phase 2 runs gated per-language SCIP rebuilds ordered by last_changed.
     {
         let phase_state = serve_state.clone();
         tokio::spawn(async move {
