@@ -3681,3 +3681,146 @@ async fn find_impact_self_heal_runs_the_rebuild_in_serve_mode() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 }
+
+// ── Rebuild gate: builder-version stamp + degraded retry ─────────────────
+
+/// Seeds the SCIP meta for `db` exactly like `rebuild` stamps it (rebuild
+/// timestamp + key format), plus the caller's extra key/values — so gate
+/// tests can shape a fresh, stale or degraded index without the helper.
+fn seed_scip_meta(db: &std::path::Path, extra: &[(&str, &str)]) {
+    let env = crate::symbols::get_shared_scip_env(db).unwrap();
+    let mut wtxn = env.write_txn().unwrap();
+    let meta: heed::Database<heed::types::Str, heed::types::Str> = env
+        .open_database(&wtxn, Some(crate::constants::SCIP_META_DB_NAME))
+        .unwrap()
+        .unwrap();
+    meta.put(&mut wtxn, crate::constants::SCIP_REBUILD_TIMESTAMP_KEY, "0")
+        .unwrap();
+    meta.put(
+        &mut wtxn,
+        crate::constants::SCIP_KEY_FORMAT_KEY,
+        crate::constants::SCIP_KEY_FORMAT,
+    )
+    .unwrap();
+    for (key, value) in extra {
+        meta.put(&mut wtxn, *key, *value).unwrap();
+    }
+    wtxn.commit().unwrap();
+}
+
+/// Shared arrangement: applicable repo (`.sln`), dummy helper, seeded SCIP
+/// meta, config timestamps showing a fresh build (last_scip ≥ last_changed)
+/// so ONLY the builder-version / degraded-retry checks can move the gate.
+/// The helper-env guard and both tempdirs are returned so they outlive the
+/// fixture.
+#[allow(clippy::type_complexity)]
+fn gate_fixture(
+    alias: &str,
+    meta_extra: &[(&str, &str)],
+) -> (
+    crate::testing::EnvRestore,
+    tempfile::TempDir,
+    tempfile::TempDir,
+    std::path::PathBuf,
+    std::sync::Arc<ServeState>,
+) {
+    let helper_root = tempfile::tempdir().unwrap();
+    let env_guard = dummy_csharp_helper(helper_root.path());
+    let (tmp, repo_path, bare) = state_with_repo(alias);
+    std::fs::write(repo_path.join("test.sln"), b"Solution File").unwrap();
+    let db = repo_path.join(DB_DIR_NAME);
+    seed_scip_meta(&db, meta_extra);
+    let state = std::sync::Arc::new(bare);
+    let now = ServeState::now_unix_secs();
+    {
+        let mut cfg = state.config.write().unwrap();
+        cfg.touch_last_changed(alias, now - 100);
+        cfg.touch_last_scip(alias, now);
+    }
+    (env_guard, helper_root, tmp, repo_path, state)
+}
+
+/// An index this binary never produced (no builder stamp — anything built
+/// before the stamp existed) must read as stale: a deployed binary rebuilds
+/// the indexes it inherited itself at startup, never waits for a manual
+/// command. This is the DRM-24427_Versioning defect class.
+#[test]
+#[serial]
+fn evaluate_rebuilds_an_index_from_an_older_binary() {
+    let (_env, _h, _tmp, repo_path, state) = gate_fixture("oldbinary", &[]);
+
+    assert_eq!(
+        state.evaluate_symbol_rebuild(
+            "csharp",
+            "oldbinary",
+            &repo_path,
+            &repo_path.join(DB_DIR_NAME)
+        ),
+        RebuildDecision::ChangedSinceLastBuild,
+        "absent builder stamp must read as stale"
+    );
+}
+
+/// A degraded index (warnings in meta, current builder version) rebuilds
+/// exactly once per serve process: the second evaluation is Fresh (no loop
+/// while the environment stays broken); a fresh process gets a fresh set.
+#[test]
+#[serial]
+fn evaluate_retries_a_degraded_index_once_per_process() {
+    let (_env, _h, _tmp, repo_path, state) = gate_fixture(
+        "degraded",
+        &[(
+            crate::constants::SCIP_INDEX_BUILDER_VERSION_KEY,
+            crate::constants::INDEX_BUILDER_VERSION,
+        )],
+    );
+    let db = repo_path.join(DB_DIR_NAME);
+    // Re-seed WITH warnings (the fixture seeded only the version stamp).
+    seed_scip_meta(
+        &db,
+        &[(
+            crate::constants::SCIP_INDEX_WARNINGS_KEY,
+            r#"["Broken.csproj: Msbuild failed when processing the file"]"#,
+        )],
+    );
+
+    assert_eq!(
+        state.evaluate_symbol_rebuild("csharp", "degraded", &repo_path, &db),
+        RebuildDecision::ChangedSinceLastBuild,
+        "a degraded index must get its one automatic retry"
+    );
+    assert_eq!(
+        state.evaluate_symbol_rebuild("csharp", "degraded", &repo_path, &db),
+        RebuildDecision::Fresh,
+        "the retry must not loop within one serve process"
+    );
+}
+
+/// A clean index with the current builder stamp and fresh timestamps stays
+/// Fresh — the gate must not churn indexes that are actually fine.
+#[test]
+#[serial]
+fn evaluate_stays_fresh_when_index_is_current_and_clean() {
+    let (_env, _h, _tmp, repo_path, state) = gate_fixture(
+        "cleanidx",
+        &[(
+            crate::constants::SCIP_INDEX_BUILDER_VERSION_KEY,
+            crate::constants::INDEX_BUILDER_VERSION,
+        )],
+    );
+
+    assert_eq!(
+        state.evaluate_symbol_rebuild(
+            "csharp",
+            "cleanidx",
+            &repo_path,
+            &repo_path.join(DB_DIR_NAME)
+        ),
+        RebuildDecision::Fresh,
+        "current + clean + fresh timestamps must not rebuild"
+    );
+    assert!(
+        !state.degraded_rebuild_attempted.contains("cleanidx"),
+        "a clean index must not consume the degraded retry"
+    );
+}

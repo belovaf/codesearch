@@ -23,7 +23,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use axum::response::{IntoResponse, Json as AxumJson};
 use colored::Colorize;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use rmcp::transport::{
     streamable_http_server::session::local::LocalSessionManager, StreamableHttpServerConfig,
     StreamableHttpService,
@@ -373,6 +373,11 @@ pub(crate) struct ServeState {
     /// their LMDB clear/write passes. Stale claims self-heal past the
     /// indexing timeout, like `active_reindexes` markers.
     symbol_rebuild_in_flight: DashMap<String, std::time::Instant>,
+    /// Aliases whose degraded index (index_warnings in meta) already got its
+    /// automatic retry this serve process. Without this, a still-broken
+    /// build environment would rebuild on every evaluation — the next serve
+    /// start retries once more, which is the operator-visible bound.
+    degraded_rebuild_attempted: DashSet<String>,
     /// Debounced deadline for persisting repos config metadata (unix millis).
     persist_deadline_unix_ms: AtomicU64,
     /// Ensures only one debounce worker task runs.
@@ -458,6 +463,7 @@ impl ServeState {
             csharp_index_status: Arc::new(DashMap::new()),
             csharp_index_error: Arc::new(DashMap::new()),
             symbol_rebuild_in_flight: DashMap::new(),
+            degraded_rebuild_attempted: DashSet::new(),
             persist_deadline_unix_ms: AtomicU64::new(0),
             persist_worker_started: AtomicBool::new(false),
             #[cfg(test)]
@@ -1255,6 +1261,25 @@ impl ServeState {
 
         if !indexer.has_index(db_path) {
             return RebuildDecision::NoIndex;
+        }
+
+        // Fresh-by-timestamp is not correct: an index built by an older
+        // binary predates both the warning capture and the helper's
+        // load-behaviour fixes (the deployed binary must never serve an
+        // index it did not produce), and an index built WITH surviving
+        // workspace failures carries those warnings in its meta. Both
+        // rebuild automatically — the version path on every binary change,
+        // the degraded path once per serve process so a still-broken
+        // environment cannot loop; the next serve start retries once.
+        if indexer.index_builder_version(db_path).as_deref()
+            != Some(crate::constants::INDEX_BUILDER_VERSION)
+        {
+            return RebuildDecision::ChangedSinceLastBuild;
+        }
+        if !indexer.index_warnings(db_path).is_empty()
+            && self.degraded_rebuild_attempted.insert(alias.to_string())
+        {
+            return RebuildDecision::ChangedSinceLastBuild;
         }
 
         if last_changed > last_scip {

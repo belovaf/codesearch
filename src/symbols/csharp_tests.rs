@@ -244,3 +244,93 @@ fn index_warnings_roundtrip_and_clean_absence() {
         "non-tracking adapters inherit the empty default"
     );
 }
+
+// ── Builder-version stamp: the rebuild's meta-write site ─────────────────
+//
+// The gate tests hand-seed meta (consumer half); this one drives the
+// producer. The write lives in `write_rebuild_meta` — the exact fn the
+// rebuild pipeline calls from its meta txn — because a fake helper cannot
+// execute on Windows: the validated filename must be a real PE, not a
+// script. Deleting the stamp write must fail this test, or every serve
+// start churns all inherited C# indexes (absent stamp reads as stale).
+
+#[test]
+fn rebuild_meta_write_stamps_version_and_writes_or_clears_warnings() {
+    use crate::constants::{INDEX_BUILDER_VERSION, SCIP_INDEX_BUILDER_VERSION_KEY};
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = dir.path().join("db");
+    let indexer = super::csharp::CSharpSymbolIndexer::new();
+
+    // Degraded previous build: stale warnings + an old binary's stamp.
+    let env = crate::symbols::get_shared_scip_env(&db).unwrap();
+    let mut wtxn = env.write_txn().unwrap();
+    let meta_db: heed::Database<heed::types::Str, heed::types::Str> = env
+        .create_database(&mut wtxn, Some(crate::constants::SCIP_META_DB_NAME))
+        .unwrap();
+    meta_db
+        .put(
+            &mut wtxn,
+            crate::constants::SCIP_INDEX_WARNINGS_KEY,
+            r#"["Old.csproj: Msbuild failed when processing the file"]"#,
+        )
+        .unwrap();
+    meta_db
+        .put(&mut wtxn, SCIP_INDEX_BUILDER_VERSION_KEY, "v0.0.0+1")
+        .unwrap();
+    wtxn.commit().unwrap();
+
+    // A clean rebuild's meta write: stamp this build, clear the warnings.
+    let env = crate::symbols::get_shared_scip_env(&db).unwrap();
+    let mut wtxn = env.write_txn().unwrap();
+    let meta_db: heed::Database<heed::types::Str, heed::types::Str> = env
+        .open_database(&wtxn, Some(crate::constants::SCIP_META_DB_NAME))
+        .unwrap()
+        .unwrap();
+    super::csharp::CSharpSymbolIndexer::write_rebuild_meta(&meta_db, &mut wtxn, &[])
+        .expect("meta write must succeed");
+    wtxn.commit().unwrap();
+
+    use crate::symbols::SymbolIndexer as _;
+    assert_eq!(
+        indexer.index_builder_version(&db).as_deref(),
+        Some(INDEX_BUILDER_VERSION),
+        "the rebuild meta write must stamp the producing build"
+    );
+    assert!(
+        indexer.index_warnings(&db).is_empty(),
+        "a clean rebuild must clear the previous run's warnings"
+    );
+
+    // A degraded rebuild's meta write persists its warnings instead.
+    let env = crate::symbols::get_shared_scip_env(&db).unwrap();
+    let mut wtxn = env.write_txn().unwrap();
+    let meta_db: heed::Database<heed::types::Str, heed::types::Str> = env
+        .open_database(&wtxn, Some(crate::constants::SCIP_META_DB_NAME))
+        .unwrap()
+        .unwrap();
+    super::csharp::CSharpSymbolIndexer::write_rebuild_meta(
+        &meta_db,
+        &mut wtxn,
+        &["Broken.csproj: Msbuild failed when processing the file".to_string()],
+    )
+    .expect("meta write must succeed");
+    wtxn.commit().unwrap();
+
+    // index_warnings_stored prepends the summary entry (summary first).
+    let warnings = indexer.index_warnings(&db);
+    assert_eq!(
+        warnings.len(),
+        2,
+        "summary entry + the raw failed-project line, got: {warnings:?}"
+    );
+    assert!(
+        warnings[0].contains("1 distinct failure(s)"),
+        "the summary entry must lead, got: {warnings:?}"
+    );
+    assert_eq!(
+        warnings[1],
+        "Broken.csproj: Msbuild failed when processing the file".to_string(),
+        "a degraded rebuild's warnings must be persisted for the answer path"
+    );
+}

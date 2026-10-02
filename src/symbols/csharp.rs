@@ -200,6 +200,7 @@ const META_KEY_FORMAT: &str = crate::constants::SCIP_KEY_FORMAT_KEY;
 /// completeness warnings from the last rebuild (see
 /// [`summarize_index_warnings`]).
 const META_INDEX_WARNINGS: &str = crate::constants::SCIP_INDEX_WARNINGS_KEY;
+const META_BUILDER_VERSION: &str = crate::constants::SCIP_INDEX_BUILDER_VERSION_KEY;
 
 /// How many distinct index-level warnings are persisted (and thus surfaced
 /// per find_impact answer) before the list is capped with an overflow note.
@@ -436,6 +437,41 @@ impl CSharpSymbolIndexer {
         let mut lock = self.helper_path.lock().unwrap();
         *lock = Some(resolved.clone()); // cache both Some and None
         resolved
+    }
+
+    /// Writes the rebuild bookkeeping shared by every scope (full and
+    /// incremental): key-format stamp, index warnings (written or cleared)
+    /// and the builder-version stamp. Called from `rebuild`'s meta txn, so
+    /// meta always describes the newest build. `pub(crate)` so the producer
+    /// test drives the exact write the pipeline runs — a fake helper cannot
+    /// execute on Windows, where the validated filename must be a real PE.
+    pub(crate) fn write_rebuild_meta(
+        meta_db: &Database<Str, Str>,
+        wtxn: &mut heed::RwTxn,
+        index_warnings: &[String],
+    ) -> Result<()> {
+        // Unconditional: has_index refuses an index whose key-format stamp is
+        // absent or stale, so a key-format change forces exactly one rebuild.
+        meta_db.put(wtxn, META_KEY_FORMAT, crate::constants::SCIP_KEY_FORMAT)?;
+        // Index-level completeness warnings from this run — written or
+        // cleared on EVERY rebuild (full or incremental) so meta always
+        // describes the newest build.
+        let stored_warnings = index_warnings_stored(index_warnings);
+        if stored_warnings.is_empty() {
+            meta_db.delete(wtxn, META_INDEX_WARNINGS)?;
+        } else {
+            let json = serde_json::to_string(&stored_warnings).unwrap_or_else(|_| "[]".to_string());
+            meta_db.put(wtxn, META_INDEX_WARNINGS, json.as_str())?;
+        }
+        // Stamp the producing build: the rebuild gate treats an index from
+        // another (or an unknown) build as stale, so a deployed binary
+        // rebuilds the indexes it inherited itself at startup.
+        meta_db.put(
+            wtxn,
+            META_BUILDER_VERSION,
+            crate::constants::INDEX_BUILDER_VERSION,
+        )?;
+        Ok(())
     }
 
     fn resolve_helper_path(&self) -> Option<PathBuf> {
@@ -1784,23 +1820,7 @@ impl SymbolIndexer for CSharpSymbolIndexer {
         if let Some(sha) = super::current_git_head(repo_path) {
             meta_db.put(&mut wtxn, META_HEAD_SHA, sha.as_str())?;
         }
-        // Unconditional: has_index refuses an index whose key-format stamp is
-        // absent or stale, so a key-format change forces exactly one rebuild.
-        meta_db.put(
-            &mut wtxn,
-            META_KEY_FORMAT,
-            crate::constants::SCIP_KEY_FORMAT,
-        )?;
-        // Index-level completeness warnings from this run — written or
-        // cleared on EVERY rebuild (full or incremental) so meta always
-        // describes the newest build.
-        let stored_warnings = index_warnings_stored(&index_warnings);
-        if stored_warnings.is_empty() {
-            meta_db.delete(&mut wtxn, META_INDEX_WARNINGS)?;
-        } else {
-            let json = serde_json::to_string(&stored_warnings).unwrap_or_else(|_| "[]".to_string());
-            meta_db.put(&mut wtxn, META_INDEX_WARNINGS, json.as_str())?;
-        }
+        Self::write_rebuild_meta(&meta_db, &mut wtxn, &index_warnings)?;
 
         wtxn.commit()?;
 
@@ -1827,7 +1847,7 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             symbols_indexed: total_symbols,
             references_stored: total_defs, // definitions only; refs resolved lazily
             duration_ms,
-            index_warnings: stored_warnings,
+            index_warnings: index_warnings_stored(&index_warnings),
         })
     }
 
@@ -1977,6 +1997,30 @@ impl SymbolIndexer for CSharpSymbolIndexer {
             _ => return Vec::new(),
         };
         serde_json::from_str(json).unwrap_or_default()
+    }
+
+    /// Which codesearch build produced this index — `None` when the stamp is
+    /// absent (pre-stamp index) or the meta is unreadable. The rebuild gate
+    /// compares against [`crate::constants::INDEX_BUILDER_VERSION`] and
+    /// rebuilds on mismatch: this binary never produced that index.
+    fn index_builder_version(&self, db_path: &Path) -> Option<String> {
+        let env = match self.open_scip_env(db_path) {
+            Ok(e) => e,
+            Err(_) => return None,
+        };
+        let rtxn = match env.read_txn() {
+            Ok(t) => t,
+            Err(_) => return None,
+        };
+        let meta_db: Database<Str, Str> = match env.open_database(&rtxn, Some(SCIP_META_DB_NAME)) {
+            Ok(Some(db)) => db,
+            _ => return None,
+        };
+        meta_db
+            .get(&rtxn, META_BUILDER_VERSION)
+            .ok()
+            .flatten()
+            .map(|s| s.to_string())
     }
 
     /// Whether a SCIP index exists AND was built with the current key format.

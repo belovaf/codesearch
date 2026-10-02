@@ -466,6 +466,15 @@ pub trait SymbolIndexer: Send + Sync {
         Vec::new()
     }
 
+    /// Which codesearch build produced the current symbol index
+    /// (`scip_meta[index_builder_version]`). `None` means absent or
+    /// unreadable — the C# rebuild gate treats that as stale, so a newly
+    /// deployed binary rebuilds the indexes it inherited itself at startup
+    /// instead of serving an index it never produced.
+    fn index_builder_version(&self, _db_path: &Path) -> Option<String> {
+        None
+    }
+
     /// The git HEAD sha the current symbol index was built for, when
     /// recorded. `None` means unknown (pre-fingerprint index, or git was
     /// unreadable at build time). Compare with the repository's current
