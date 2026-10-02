@@ -10,7 +10,7 @@
 
 use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Cell, Row, Table, TableState};
 
 /// Format elapsed time since `started_at` as "Up xxd xxh xxm xxs".
@@ -321,6 +321,48 @@ pub fn render_header(
     f.render_widget(ratatui::widgets::Paragraph::new(title_line), centered[0]);
 }
 
+/// The C# alias-column indicator: `(glyph, style)` when the status carries
+/// one. Color belongs to the indicator only — degraded (warnings) reads as
+/// yellow ⚠, a general error as fully red `!` — so a table full of
+/// warnings-degraded repos does not read as half the fleet being down.
+pub fn csharp_indicator(status: &str, pulse: bool) -> Option<(&'static str, Style)> {
+    match status {
+        "ready" => Some((" C#·", Style::default().fg(Color::White))),
+        "partial" => Some((" C#⚠", Style::default().fg(Color::Yellow))),
+        "error" => Some((
+            " C#!",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )),
+        "indexing" => {
+            let style = if pulse {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            Some((" C#…", style))
+        }
+        _ => None,
+    }
+}
+
+/// The TypeScript alias-column indicator — same severity language as the C#
+/// one (`ts_indicator("partial")` is yellow; TS has no live Partial source
+/// yet, but the shared vocabulary must already agree).
+pub fn ts_indicator(status: &str) -> Option<(&'static str, Style)> {
+    match status {
+        "ready" => Some((" TS·", Style::default().fg(Color::White))),
+        "partial" => Some((" TS⚠", Style::default().fg(Color::Yellow))),
+        "error" => Some((
+            " TS!",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )),
+        "indexing" => Some((" TS…", Style::default().fg(Color::DarkGray))),
+        _ => None,
+    }
+}
+
 pub fn render_table(
     f: &mut ratatui::Frame,
     area: Rect,
@@ -385,67 +427,30 @@ pub fn render_table(
             };
             let lock_cell = lock_cell(&repo.lock_mode);
 
-            // Alias text with optional C# indicator suffix, plus its base style.
-            let (mut alias_text, mut alias_style) = match repo.csharp_index.as_str() {
-                "ready" => (
-                    format!("{} C#·", repo.alias),
-                    Style::default().fg(Color::White),
-                ),
-                // Degraded index: built despite survived workspace failures —
-                // red and loud, the detail panel carries the failures.
-                "partial" => (
-                    format!("{} C#⚠", repo.alias),
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                ),
-                "error" => (
-                    format!("{} C#!", repo.alias),
-                    Style::default().fg(Color::Red),
-                ),
-                "indexing" => {
-                    let s = if pulse_bright() {
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(Color::DarkGray)
-                    };
-                    (format!("{} C#…", repo.alias), s)
-                }
-                _ => (repo.alias.clone(), Style::default().fg(Color::White)),
+            // Alias text stays NEUTRAL — color lives only on the language
+            // indicators: yellow ⚠ for a degraded (warnings) index, fully red
+            // ! for a general error. A table with red aliases reads as half
+            // the fleet being down, which a warnings-degraded index is not.
+            let base_alias_style = if repo.is_remote {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::ITALIC)
+            } else {
+                Style::default().fg(Color::White)
             };
+            let mut alias_spans: Vec<Span> =
+                vec![Span::styled(repo.alias.clone(), base_alias_style)];
 
-            // Append the TypeScript indicator alongside the C# one when a TS
-            // index exists. The alias column is the canonical multi-language
-            // symbol-index indicator (the status cell only carries C#).
-            match repo.typescript_index.as_str() {
-                "ready" => alias_text.push_str(" TS·"),
-                "error" => {
-                    alias_text.push_str(" TS!");
-                    alias_style = alias_style.fg(Color::Red);
-                }
-                "partial" => {
-                    alias_text.push_str(" TS⚠");
-                    alias_style = alias_style.fg(Color::Red);
-                }
-                "indexing" => alias_text.push_str(" TS…"),
-                _ => {}
+            if let Some((glyph, style)) =
+                csharp_indicator(repo.csharp_index.as_str(), pulse_bright())
+            {
+                alias_spans.push(Span::styled(glyph, style));
+            }
+            if let Some((glyph, style)) = ts_indicator(repo.typescript_index.as_str()) {
+                alias_spans.push(Span::styled(glyph, style));
             }
 
-            // Red bold alias if the repo is in an error state.
-            if repo.status == "error" {
-                alias_style = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
-            }
-
-            // Mounted remote projects render italic to signal they live on a
-            // peer (cyan unless an error already claimed the color).
-            if repo.is_remote {
-                alias_style = alias_style.add_modifier(Modifier::ITALIC);
-                if repo.status != "error" {
-                    alias_style = alias_style.fg(Color::Cyan);
-                }
-            }
-
-            let alias_cell = Cell::from(alias_text).style(alias_style);
+            let alias_cell = Cell::from(Text::from(Line::from(alias_spans)));
 
             Row::new(vec![
                 alias_cell,
@@ -526,17 +531,12 @@ pub fn render_detail(
         repo.path.clone()
     };
 
-    // Mounted remote projects show italic here too (matches the table): cyan
-    // normally, red when in error state so the color stays consistent with the
-    // table's error highlight. Local rows are unchanged (white bold).
+    // Mounted remote projects show italic here too (matches the table): cyan,
+    // never red — alias text stays neutral on every surface; the status line
+    // below carries the error severity. Local rows are unchanged (white bold).
     let alias_style = if repo.is_remote {
-        let color = if repo.status == "error" {
-            Color::Red
-        } else {
-            Color::Cyan
-        };
         Style::default()
-            .fg(color)
+            .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD | Modifier::ITALIC)
     } else {
         Style::default()
@@ -1300,7 +1300,7 @@ fn detail_status_style(status: &str, csharp: &str) -> (String, Color) {
                 },
             ),
             "error" => ("Open C#!".to_string(), Color::Red),
-            "partial" => ("Open C#⚠".to_string(), Color::Red),
+            "partial" => ("Open C#⚠".to_string(), Color::Yellow),
             _ => ("Open".to_string(), Color::Green),
         },
         "warm" => match csharp {
@@ -1314,7 +1314,7 @@ fn detail_status_style(status: &str, csharp: &str) -> (String, Color) {
                 },
             ),
             "error" => ("Warm C#!".to_string(), Color::Red),
-            "partial" => ("Warm C#⚠".to_string(), Color::Red),
+            "partial" => ("Warm C#⚠".to_string(), Color::Yellow),
             _ => ("Warm".to_string(), Color::Yellow),
         },
         "readonly" => ("Readonly".to_string(), Color::Cyan),
@@ -1396,18 +1396,50 @@ mod tests {
         );
     }
 
-    /// A degraded (partial) C# index renders red with the ⚠ glyph in the
-    /// detail panel — same urgency class as an error, distinct label.
+    /// A degraded (partial) C# index renders YELLOW with the ⚠ glyph in the
+    /// detail panel — a warning, not an error; only a general error is red.
     #[test]
-    fn detail_status_style_maps_partial_to_red_warning() {
+    fn detail_status_style_maps_partial_to_yellow_warning() {
         assert_eq!(
             detail_status_style("open", "partial"),
-            ("Open C#⚠".to_string(), Color::Red)
+            ("Open C#⚠".to_string(), Color::Yellow)
         );
         assert_eq!(
             detail_status_style("warm", "partial"),
-            ("Warm C#⚠".to_string(), Color::Red)
+            ("Warm C#⚠".to_string(), Color::Yellow)
         );
+        assert_eq!(
+            detail_status_style("warm", "error").1,
+            Color::Red,
+            "a general error stays fully red"
+        );
+    }
+
+    /// Alias-column indicators: the alias text is styled by the caller and
+    /// stays neutral; degraded reads yellow, only a general error is red.
+    #[test]
+    fn alias_indicators_use_yellow_for_degraded_and_red_only_for_errors() {
+        let (glyph, style) = csharp_indicator("partial", false).unwrap();
+        assert_eq!(glyph, " C#⚠");
+        assert_eq!(style, Style::default().fg(Color::Yellow));
+
+        let (glyph, style) = csharp_indicator("error", false).unwrap();
+        assert_eq!(glyph, " C#!");
+        assert_eq!(
+            style,
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        );
+
+        let (glyph, style) = ts_indicator("partial").unwrap();
+        assert_eq!(glyph, " TS⚠");
+        assert_eq!(style, Style::default().fg(Color::Yellow));
+
+        // The transient dim/pulse phase: indexing indicators must stay dim —
+        // an inherited bright style here once turned the whole alias red.
+        let (_, style) = csharp_indicator("indexing", false).unwrap();
+        assert_eq!(style, Style::default().fg(Color::DarkGray));
+        let (_, style) = ts_indicator("indexing").unwrap();
+        assert_eq!(style, Style::default().fg(Color::DarkGray));
     }
 
     /// The alias-column width budget must cover the actually rendered
