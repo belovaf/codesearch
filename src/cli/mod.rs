@@ -528,7 +528,7 @@ pub enum Commands {
 
     /// Download embedding models
     Setup {
-        /// Model to download (defaults to mxbai-embed-xsmall-v1)
+        /// Model to download (defaults to minilm-l6-q)
         #[arg(long)]
         model: Option<String>,
     },
