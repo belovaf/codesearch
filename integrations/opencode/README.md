@@ -224,6 +224,11 @@ Precedence, lowest to highest:
 | `CODESEARCH_PLUGIN_HEALTH` | `true` | Health probing on/off. |
 | `CODESEARCH_PLUGIN_DEBUG` | `false` | Verbose plugin logs. |
 
+Settings are resolved **once, at plugin setup** (the host calls `setup()` when
+the plugin loads). Editing `codesearch.json` or a `CODESEARCH_*` variable
+mid-session therefore does not take effect until OpenCode restarts or the
+plugin is reloaded.
+
 ### Hub discovery order
 
 The plugin resolves the MCP endpoint in this order, first non-empty wins:

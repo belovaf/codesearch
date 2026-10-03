@@ -661,25 +661,28 @@ class McpClient {
 
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), timeoutMs)
-    let response: Response
+    // The timer (and its abort signal) must stay armed through the body read:
+    // `response.text()` is as capable of hanging as the response headers are
+    // (undici's ~300 s bodyTimeout), and clearing the timer early would leave
+    // the serial call chain blocked far past the requested timeout.
     try {
-      response = await fetch(this.url, {
+      const response = await fetch(this.url, {
         method: "POST",
         headers,
         body: JSON.stringify(payload),
         signal: controller.signal,
       })
+      if (!response.ok) throw new Error(`codesearch HTTP ${response.status} ${response.statusText}`)
+      const session = response.headers.get("mcp-session-id")
+      const body = await response.text()
+      const messages = parseMcpBody(body) as Loose[]
+      if (messages.length === 0 && payload.id !== undefined) {
+        throw new Error(`codesearch returned no JSON-RPC message for ${String(payload.method)}`)
+      }
+      return { session, messages }
     } finally {
       clearTimeout(timer)
     }
-    if (!response.ok) throw new Error(`codesearch HTTP ${response.status} ${response.statusText}`)
-    const session = response.headers.get("mcp-session-id")
-    const body = await response.text()
-    const messages = parseMcpBody(body) as Loose[]
-    if (messages.length === 0 && payload.id !== undefined) {
-      throw new Error(`codesearch returned no JSON-RPC message for ${String(payload.method)}`)
-    }
-    return { session, messages }
   }
 
   private resultOf(tool: string, messages: Loose[]): unknown {
@@ -1327,8 +1330,12 @@ export default {
         }
 
         // 2. Prune guard: hide grep/glob from the model when enforcement is
-        //    structural, so the first move is a codesearch call.
-        const pruneActive = settings.guards.mode === "prune" && !!scope.project
+        //    structural, so the first move is a codesearch call. Like block
+        //    mode, only engage while the hub is confirmed reachable —
+        //    otherwise the removed tools would contradict the "grep/glob is an
+        //    acceptable fallback" guidance injected below.
+        const pruneActive =
+          settings.guards.mode === "prune" && !!scope.project && health.state === "ok"
         if (pruneActive && isPlainObject(event.tools)) {
           for (const tool of settings.guards.tools) delete (event.tools as Loose)[tool]
         }
@@ -1342,7 +1349,7 @@ export default {
           if (pruneActive) {
             extra.push(`- grep and glob are intentionally unavailable in this project (codesearch guard mode "prune"); use the codesearch tools for discovery.`)
           }
-          if (health.state === "down") {
+          if (health.state === "down" && !pruneActive) {
             extra.push(`- The codesearch serve hub is unreachable right now; grep/glob is an acceptable fallback until it recovers.`)
           }
           if (freshUnindexedWarning(scope)) {
@@ -1729,8 +1736,14 @@ export default {
         for (const path of candidates) {
           if (outlines.length >= settings.compaction.maxFiles || Date.now() >= deadline || budget <= 0) break
           try {
-            const target = path.startsWith(scope.project + "/") ? path.slice(scope.project.length + 1) : path
-            const result = await client.call(
+            // Strip the project root the same way `relativeTo` does for the
+            // freshness notice: it normalizes both sides (including the
+            // win32 lowercase rule), so absolute paths, alias-prefixed paths
+            // and already-relative paths all resolve consistently. Stripping
+            // a literal alias prefix here silently produced absolute targets
+            // on Windows, where the case-normalized path never matched.
+            const target = relativeTo(path, scope.projectPath || directory) || path
+            const result = await background.call(
               "explore",
               { project: scope.project, target, kind: "outline" },
               { timeoutMs: Math.max(500, deadline - Date.now()), retry: false },

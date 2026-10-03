@@ -64,7 +64,8 @@ const STATUS = {
   hub: { indexed: true, status: "ready" },
 }
 
-function startMockServer(): Promise<{ url: string; close: () => Promise<void> }> {
+function startMockServer(): Promise<{ url: string; close: () => Promise<void>; calls: Loose[] }> {
+  const calls: Loose[] = []
   const server = http.createServer((req, res) => {
     let body = ""
     req.on("data", (chunk) => (body += chunk))
@@ -117,6 +118,7 @@ function startMockServer(): Promise<{ url: string; close: () => Promise<void> }>
       if (message.method === "tools/call") {
         const name = String(message.params?.name ?? "")
         const args = (message.params?.arguments ?? {}) as Loose
+        calls.push({ name, args })
         let payload: unknown = {}
         if (name === "status") {
           payload = STATUS
@@ -148,6 +150,7 @@ function startMockServer(): Promise<{ url: string; close: () => Promise<void> }>
           new Promise((done) => {
             server.close(() => done(undefined))
           }),
+        calls,
       })
     })
   })
@@ -160,6 +163,8 @@ function makeCtx(directory: string) {
   const commands: Loose[] = []
   const skills: Loose[] = []
   const prompts: string[] = []
+  const eventQueue: Loose[] = []
+  let eventWake: (() => void) | undefined
 
   const context: Loose = {
     app: { version: "smoke" },
@@ -209,13 +214,34 @@ function makeCtx(directory: string) {
     event: {
       subscribe: async function* (options?: { signal?: AbortSignal }) {
         const signal = options?.signal
-        if (signal?.aborted) return
-        await new Promise<void>((resolve) => signal?.addEventListener("abort", () => resolve()))
+        while (!signal?.aborted) {
+          if (!eventQueue.length) {
+            await new Promise<void>((resolve) => {
+              eventWake = resolve
+              signal?.addEventListener("abort", () => resolve(), { once: true })
+            })
+          }
+          while (eventQueue.length) yield eventQueue.shift() as Loose
+        }
       },
     },
   }
 
-  return { context, hooks, toolHooks, tools, commands, skills, prompts }
+  return {
+    context,
+    hooks,
+    toolHooks,
+    tools,
+    commands,
+    skills,
+    prompts,
+    emit: (event: Loose) => {
+      eventQueue.push(event)
+      const wake = eventWake
+      eventWake = undefined
+      wake?.()
+    },
+  }
 }
 
 async function setupPlugin(directory: string) {
@@ -322,6 +348,25 @@ async function main(): Promise<void> {
   await one.app.toolHooks["execute.after"][0](nudgeAgain)
   assert.doesNotMatch(String(nudgeAgain.result.output), /tip:/, "the nudge fires once per session")
 
+  // Compaction assist: recently edited files become explore outlines, and the
+  // target sent to the server must be project-relative. Regression guard: an
+  // alias-prefix strip left absolute targets that could never match on
+  // Windows, where the plugin lowercases paths but the server strips them
+  // case-sensitively — a silent compaction no-op.
+  one.app.emit({ type: "file.edited", data: { file: "/work/my-service/src/uploader.ts" } })
+  await new Promise((resolve) => setTimeout(resolve, 150))
+  const compactionEvent: Loose = { system: [] }
+  await one.app.hooks.compaction[0](compactionEvent)
+  const compacted = compactionEvent.system.map((p: Loose) => p.text).join("\n")
+  assert.match(compacted, /src\/uploader\.ts/, "compaction outline names the relative file")
+  const exploreCall = mock.calls.filter((c) => c.name === "explore").at(-1)
+  assert.ok(exploreCall, "compaction asked the server for an outline")
+  assert.equal(
+    exploreCall!.args.target,
+    "src/uploader.ts",
+    "compaction passes the project-relative target, not an absolute/alias-prefixed path",
+  )
+
   // Scope tool reports the resolved project and index state.
   const scopeResult = (await one.app.tools[0].execute({}, {})) as { content: string }
   const scopeInfo = JSON.parse(scopeResult.content)
@@ -346,12 +391,21 @@ async function main(): Promise<void> {
 
   process.env.CODESEARCH_PLUGIN_GUARDS = "prune"
   const pruned = await setupPlugin("/work/my-service")
-  const prunedEvent = userMessage("s2", "p1", "How does the uploader work?")
-  await pruned.app.hooks.context[0](prunedEvent)
-  assert.equal(prunedEvent.tools.grep, undefined, "prune removes grep")
-  assert.equal(prunedEvent.tools.glob, undefined, "prune removes glob")
-  assert.ok(prunedEvent.tools.read, "prune keeps unrelated tools")
-  assert.match(prunedEvent.system.map((p: Loose) => p.text).join("\n"), /intentionally unavailable/)
+  // Prune only engages once the startup health probe has confirmed the hub is
+  // reachable; poll with fresh sessions instead of racing the probe (the
+  // guidance is injected once per session, so each attempt needs its own).
+  let prunedEvent: Loose | undefined
+  for (let i = 0; i < 30 && !prunedEvent; i++) {
+    const candidate = userMessage(`s2-${i}`, `p${i}`, "How does the uploader work?")
+    await pruned.app.hooks.context[0](candidate)
+    if (candidate.tools.grep === undefined) prunedEvent = candidate
+    else await new Promise((r) => setTimeout(r, 100))
+  }
+  assert.ok(prunedEvent, "prune engages once the hub is reachable")
+  assert.equal(prunedEvent!.tools.grep, undefined, "prune removes grep")
+  assert.equal(prunedEvent!.tools.glob, undefined, "prune removes glob")
+  assert.ok(prunedEvent!.tools.read, "prune keeps unrelated tools")
+  assert.match(prunedEvent!.system.map((p: Loose) => p.text).join("\n"), /intentionally unavailable/)
   await pruned.cleanup()
 
   /* ---------------- block mode (fail-open everywhere else) ---------------- */
@@ -375,6 +429,25 @@ async function main(): Promise<void> {
   await uncovered.app.toolHooks["execute.before"][0]({ tool: "grep", input: {}, sessionID: "s4" })
   await uncovered.cleanup()
   await blocked.cleanup()
+
+  /* ---------------- prune fails open while the hub is down ---------------- */
+
+  process.env.CODESEARCH_PLUGIN_GUARDS = "prune"
+  process.env.CODESEARCH_URL = "http://127.0.0.1:1/mcp"
+  const downPrune = await setupPlugin("/work/my-service")
+  // Let the startup probe fail (connection refused) so health settles on down.
+  await new Promise((resolve) => setTimeout(resolve, 300))
+  const downEvent = userMessage("s5", "d1", "Where is the uploader?")
+  await downPrune.app.hooks.context[0](downEvent)
+  assert.ok(downEvent.tools.grep, "prune keeps grep visible while the hub is down")
+  assert.ok(downEvent.tools.glob, "prune keeps glob visible while the hub is down")
+  assert.match(
+    downEvent.system.map((p: Loose) => p.text).join("\n"),
+    /unreachable|acceptable fallback/,
+    "guidance names the grep/glob fallback while the hub is down",
+  )
+  await downPrune.cleanup()
+  process.env.CODESEARCH_URL = mock.url
 
   delete process.env.CODESEARCH_PLUGIN_GUARDS
   // Give any in-flight startup probe a moment before the mock hub disappears.
