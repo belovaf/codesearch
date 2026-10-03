@@ -14,6 +14,12 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.4.12]
+
+### Added
+
+- **OpenCode plugin integration (`integrations/opencode/`).** codesearch's MCP `initialize` instructions are advisory and connection-scoped: they cannot resolve the session directory to a registered project, see a `grep` return nothing, recover a dead serve hub, notice an unregistered worktree, or keep file outlines alive across compaction. The new self-contained OpenCode v2 plugin (no runtime dependencies, fail-open throughout) adds host-side behaviour around the same MCP server: it resolves the working directory to a project alias and injects scope-aware guidance once per session, turns a zero-hit `grep`/`glob` into index hits, offers `nudge`/`prune`/`block` codesearch-first guards that deny only while the hub is confirmed reachable and the repo is registered, probes `/healthz` and asks OpenCode to reload failed MCP servers (with optional local `codesearch serve` auto-start), warns when a registered index is empty or model-less, notes just-edited files while the watcher catches up, captures `explore` outlines into the compaction prompt, and registers `/codesearch`, `/codesearch-status` and `/codesearch-index` commands, a `codesearch_scope` tool and a `codesearch` skill. Includes a config reference, install/usage docs and a mock-host smoke test.
+
 ## [1.4.11]
 
 ### Changed
