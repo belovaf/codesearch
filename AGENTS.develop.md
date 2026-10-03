@@ -187,7 +187,7 @@ TUI `i` overlay. The TUI discovery tick is config-only (zero HTTP).
 ## Runtime locations
 
 - **Runtime dir**: `C:\Users\develterf\.local\bin\` — contains `codesearch.exe` and `helpers/csharp/scip-csharp.exe`. This is where `codesearch serve` runs from.
-- **Build:** via `build.ps1` (repo root) — it self-heals the bare-flag quirk and sets `CARGO_TARGET_DIR` so `target/` stays outside the repo.
+- **Build:** via `build.ps1` (repo root) — it self-heals the bare-flag quirk and sets `CARGO_TARGET_DIR` so `target/` stays outside the repo. Debug-only (issue #192): `-Release` is refused, release artifacts come from CI; rust-lld is pinned in `.cargo/config.toml` (bin rebuild ~2x faster).
 - **Build dir**: `target/release/` — lives **outside the repo** (set via `CARGO_TARGET_DIR`). For compilation only. Never run codesearch from this location.
 - **Logs**: `~\.codesearch\logs\` — codesearch writes structured logs here during serve. Check these for startup errors, rebuild failures, and helper detection messages.
 
