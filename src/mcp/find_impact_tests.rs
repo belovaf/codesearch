@@ -287,6 +287,36 @@ fn fingerprint_fields_present_when_set_and_omitted_when_none() {
 }
 
 #[test]
+fn index_age_sentinel_serializes_as_null_and_real_ages_as_numbers() {
+    use crate::symbols::{FindImpactResult, SymbolReference};
+
+    let result = |age: u64| FindImpactResult {
+        symbol: "FieldDefinition.Validate".to_string(),
+        resolved_symbol: None,
+        references: vec![SymbolReference {
+            file: PathBuf::from("a.cs"),
+            start_line: 1,
+            end_line: 1,
+            kind: "definition".to_string(),
+        }],
+        warnings: Vec::new(),
+        index_age_seconds: age,
+        language: "csharp".to_string(),
+        scope: "project:p".to_string(),
+        index_head_sha: None,
+        current_head_sha: None,
+    };
+
+    // u64::MAX is `index_age`'s unreadable-index sentinel; a consumer must
+    // see "unknown" (null), not 18446744073709551615 seconds.
+    let unknown: serde_json::Value = serde_json::to_value(result(u64::MAX)).unwrap();
+    assert_eq!(unknown["index_age_seconds"], serde_json::Value::Null);
+
+    let known: serde_json::Value = serde_json::to_value(result(12)).unwrap();
+    assert_eq!(known["index_age_seconds"], serde_json::json!(12));
+}
+
+#[test]
 fn ambiguity_envelope_serializes_the_four_documented_fields() {
     let ambiguity = crate::symbols::SymbolAmbiguity {
         ambiguous: true,
