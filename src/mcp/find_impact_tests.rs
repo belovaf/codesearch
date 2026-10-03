@@ -9,7 +9,7 @@
 
 use super::{
     find_impact_with_budget, missing_index_warning, resolve_find_impact_budget_secs,
-    ImpactLookupOutcome,
+    ImpactLookupOutcome, SymbolIndexHeal,
 };
 use crate::constants::{DEFAULT_FIND_IMPACT_BUDGET_SECS, FIND_IMPACT_BUDGET_SECS_ENV};
 use crate::symbols::{SymbolLookupBusy, SymbolReference};
@@ -864,12 +864,13 @@ async fn clean_resolved_answer_omits_the_warnings_field() {
 }
 
 /// The missing-index warning is what keeps a never-built symbol index's
-/// empty reference list from passing for "no callers": it must name the
-/// language, state UNKNOWN explicitly, and tell the caller to retry after
-/// the background rebuild.
+/// empty reference list from passing for "no callers": whatever the heal
+/// status, it must name the language and state UNKNOWN explicitly. The
+/// wording per status must also stay honest — "a background rebuild was
+/// started" is only allowed when one actually was.
 #[test]
 fn missing_index_warning_names_language_and_marks_answer_unknown() {
-    let warning = missing_index_warning("csharp");
+    let warning = missing_index_warning("csharp", SymbolIndexHeal::BackgroundStarted);
     assert!(
         warning.contains("csharp"),
         "must name the language, got: {warning}"
@@ -881,6 +882,35 @@ fn missing_index_warning_names_language_and_marks_answer_unknown() {
     assert!(
         warning.contains("retry"),
         "must tell the caller to retry after the rebuild, got: {warning}"
+    );
+}
+
+#[test]
+fn missing_index_warning_manual_names_the_build_command() {
+    let warning = missing_index_warning("typescript", SymbolIndexHeal::Manual);
+    assert!(warning.contains("UNKNOWN"), "got: {warning}");
+    assert!(
+        warning.contains("codesearch index symbol"),
+        "must tell the caller how to build the index, got: {warning}"
+    );
+    assert!(
+        !warning.contains("rebuild was started"),
+        "nothing was started — must not claim it, got: {warning}"
+    );
+}
+
+#[test]
+fn missing_index_warning_not_applicable_explains_why_and_promises_nothing() {
+    let reason = "the scip-typescript adapter requires a top-level tsconfig.json (monorepo layouts are not resolved yet)";
+    let warning = missing_index_warning("typescript", SymbolIndexHeal::NotApplicable(reason));
+    assert!(warning.contains("UNKNOWN"), "got: {warning}");
+    assert!(
+        warning.contains("tsconfig.json"),
+        "must surface the indexer's own reason, got: {warning}"
+    );
+    assert!(
+        !warning.contains("rebuild was started"),
+        "a non-applicable repo can never be rebuilt here — must not claim a rebuild, got: {warning}"
     );
 }
 

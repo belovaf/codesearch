@@ -523,6 +523,14 @@ pub trait SymbolIndexer: Send + Sync {
         true
     }
 
+    /// Why `applies_to` would refuse a repository, in one clause. Surfaced
+    /// by find_impact's missing-index warning so a repo that can never get
+    /// a symbol index says so — instead of promising a rebuild that will
+    /// not happen. Adapters override next to their `applies_to`.
+    fn applicability_hint(&self) -> &'static str {
+        "the repository has no entrypoint this symbol indexer recognizes"
+    }
+
     /// Downcast to `Any` for concrete-type method access (e.g. `prewarm_ref_cache`).
     ///
     /// This is needed because some adapter-specific methods (like Phase 3 pre-warm)
