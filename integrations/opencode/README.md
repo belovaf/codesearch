@@ -454,18 +454,23 @@ hub uses.
 
 ## Development
 
-The plugin is dependency-free at runtime. For type checking and the smoke
-test (which runs the plugin against a mock OpenCode context and a mock MCP
-server):
+The plugin is dependency-free at runtime. For type checking and the tests
+(unit tests for the pure helpers and the health runner, plus an end-to-end
+smoke test against a mock OpenCode host and MCP server):
 
 ```bash
 cd integrations/opencode
 npm install          # dev-only: typescript + @types/node
 npm run typecheck    # tsc --noEmit
-npm run smoke        # node test/smoke.ts (Node >= 23.6, or: bun test/smoke.ts)
+npm run unit         # node test/unit.ts  — stripJsonc + HealthRunner (Node >= 23.6)
+npm run smoke        # node test/smoke.ts — end-to-end vs mock host/MCP (or: bun)
+npm test             # typecheck + unit + smoke
 ```
 
+`test/unit.ts` covers the JSONC scanner (comments, string escapes, trailing
+commas including comment-separated ones) and the health runner (probe
+transitions, backoff/reconnect, recovery callback, stop, disabled mode).
 `test/smoke.ts` covers scope resolution, guidance injection and deduplication,
 zero-hit rescue, the one-time nudge, prune and block modes (including
-fail-open for unregistered directories), the commands, the scope tool and the
-skill registration.
+fail-open for unregistered directories and an unreachable hub), compaction
+outlines, the commands, the scope tool and the skill registration.

@@ -337,7 +337,11 @@ function configDir(): string {
  * Strip `//` and block comments plus trailing commas from JSONC, honouring
  * string literals. Enough for OpenCode's config files.
  */
-function stripJsonc(text: string): string {
+/**
+ * Strip JSONC comments and trailing commas. Exported for `test/unit.ts`; the
+ * host consumes the default export only.
+ */
+export function stripJsonc(text: string): string {
   let out = ""
   let inString = false
   let escaped = false
@@ -368,8 +372,25 @@ function stripJsonc(text: string): string {
       continue
     }
     if (ch === ",") {
+      // A trailing comma may sit before whitespace AND comments, e.g.
+      //   "a": 1, // keep this member last
+      // }
+      // Skip both while looking ahead for the closing bracket.
       let j = i + 1
-      while (j < text.length && /\s/.test(text[j])) j++
+      for (;;) {
+        while (j < text.length && /\s/.test(text[j])) j++
+        if (text[j] === "/" && text[j + 1] === "/") {
+          while (j < text.length && text[j] !== "\n") j++
+          continue
+        }
+        if (text[j] === "/" && text[j + 1] === "*") {
+          j += 2
+          while (j < text.length && !(text[j] === "*" && text[j + 1] === "/")) j++
+          j += 2 // skip the closing */
+          continue
+        }
+        break
+      }
       if (text[j] === "}" || text[j] === "]") continue // drop trailing comma
     }
     out += ch
@@ -951,7 +972,11 @@ function buildScopePrelude(scope: ScopeInfo, extra: string[]): string {
  * Health runner
  * ------------------------------------------------------------------ */
 
-class HealthRunner {
+/**
+ * Periodic `/healthz` probe with backoff and optional MCP reload. Exported for
+ * `test/unit.ts`; the host consumes the default export only.
+ */
+export class HealthRunner {
   private timer: ReturnType<typeof setTimeout> | null = null
   private stopped = false
   private failures = 0

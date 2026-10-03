@@ -3,7 +3,8 @@
  *
  * Runs the plugin against a mock OpenCode context and a mock codesearch MCP
  * server (streamable HTTP) so scope resolution, guidance injection, zero-hit
- * rescue, the nudge/prune/block guards, commands, the scope tool and the skill
+ * rescue, the nudge/prune/block guards (including prune fail-open while the
+ * hub is down), compaction outlines, commands, the scope tool and the skill
  * registration are exercised end-to-end without a real model session.
  *
  * Run (Node >= 23.6 strips types natively):
