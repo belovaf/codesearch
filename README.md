@@ -575,6 +575,7 @@ In the `codesearch serve` TUI, mounts appear in **italic/cyan**, distinguishing 
 | `CODESEARCH_ALLOWED_HOSTS` | Comma-separated hostname allowlist for the MCP streamable-HTTP transport (unset = loopback only: `localhost`, `127.0.0.1`, `::1`). Set this to your container/service hostname when serve runs behind a container network or reverse proxy — see [Security](#security). |
 | `CODESEARCH_DISABLE_HOST_VALIDATION` | `1`/`true` disables the MCP transport's Host-header allowlist entirely (DNS-rebinding protection off). Only safe behind a reverse proxy/firewall that already restricts inbound Host headers — see [Security](#security). |
 | `CODESEARCH_MCP_MODE` | MCP mode: auto, client, local |
+| `CODESEARCH_HOME` | Relocate the entire global root (`repos.json`, models cache, logs, `serve_url`, global ignore/extension files) away from `~/.codesearch`. Must be an absolute path; unset = `~/.codesearch`. Per-file overrides like `CODESEARCH_REPOS_CONFIG` still win |
 | `CODESEARCH_REPOS_CONFIG` | Path to repos.json |
 | `CODESEARCH_REPO_IDLE_TIMEOUT_SECS` | Idle eviction timeout (default: 1800) |
 | `CODESEARCH_CACHE_MAX_MEMORY` | Embedding cache MB (default: 500) |
