@@ -371,23 +371,36 @@ fn read_ref_warnings(env: &TrackedEnv, rtxn: &heed::RoTxn<'_>, canonical: &str) 
 /// - `"csharp App . FieldDefinition#Validate()."` → `"Validate"`
 /// - `"csharp SmallSolution.Library . Calculator#Add(int, int)."` → `"Add"`
 /// - `"csharp . . . Namespace.TopLevel"` → `"TopLevel"`
-fn extract_simple_name(scip_symbol: &str) -> String {
-    // Strip trailing suffix chars: "Validate()." → "Validate", "MyService#" → "MyService"
-    let cleaned = scip_symbol
-        .trim_end_matches('.')
-        .trim_end_matches("()")
-        .trim_end_matches('#');
-    // Take last non-empty segment after '#' or '.'
-    let last_segment = cleaned
-        .rsplit(['#', '.'])
-        .find(|s| !s.trim().is_empty())
-        .unwrap_or(cleaned)
-        .trim();
-    // Strip method parameters (e.g. "Add(int, int)" → "Add")
-    last_segment
+///
+/// Parameter lists are stripped BEFORE segmenting: key format 2.0 writes
+/// fully-qualified parameter types (`SaveBatchAsync(int, System.Collections
+/// .Generic.IReadOnlyList<global::…>)`), and splitting on `.` first would
+/// land inside the parameters — the "Activity, int)" fragments that left
+/// every parameterized method unresolvable by fuzzy name.
+pub(crate) fn extract_simple_name(scip_symbol: &str) -> String {
+    // Method/field segment: after the last '#' (types without '#' keep the
+    // whole string — their name is the last '.'-segment below; a bare
+    // trailing '#' falls back to the pre-# text).
+    let after_hash = scip_symbol.rsplit('#').next().unwrap_or(scip_symbol);
+    let base = if after_hash.trim().is_empty() {
+        scip_symbol
+    } else {
+        after_hash
+    };
+    // Strip parameters FIRST, then the generic-arity marker: keys group all
+    // overloads and arities under one queryable name.
+    let name = base
         .split('(')
         .next()
-        .unwrap_or(last_segment)
+        .unwrap_or(base)
+        .split('`')
+        .next()
+        .unwrap_or(base);
+    let cleaned = name.trim().trim_end_matches('.').trim_end_matches('#');
+    cleaned
+        .rsplit('.')
+        .find(|s| !s.trim().is_empty())
+        .unwrap_or(cleaned)
         .trim()
         .to_string()
 }

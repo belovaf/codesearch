@@ -334,3 +334,44 @@ fn rebuild_meta_write_stamps_version_and_writes_or_clears_warnings() {
         "a degraded rebuild's warnings must be persisted for the answer path"
     );
 }
+
+// ── Simple-name extraction (fuzzy-lookup keys) ────────────────────────────
+
+/// The live defect this pins: key format 2.0 writes fully-qualified
+/// parameter types, and the old extractor split on '.' BEFORE stripping the
+/// parameter list — landing inside the parameters. Every parameterized
+/// method then keyed `scip_simple_names` under a fragment like
+/// "Activity, int)" and fuzzy find_impact resolved NOTHING repository-wide
+/// after the version-gate rebuilt all indexes to format 2.0.
+#[test]
+fn extract_simple_name_strips_fqn_parameters_before_segmenting() {
+    let cases = [
+        // (canonical key, expected simple name)
+        ("csharp App . FieldDefinition#Validate().", "Validate"),
+        (
+            "csharp SmallSolution.Library . Calculator#Add(int, int).",
+            "Add",
+        ),
+        (
+            "csharp Acme.Catalog.Azure.TableStorage.DataStore . ActivityVersionStore#SaveBatchAsync(int, System.Collections.Generic.IReadOnlyList<global::Acme.Catalog.Azure.TableStorage.DataStore.Entities.ActivityVersion>).",
+            "SaveBatchAsync",
+        ),
+        (
+            "csharp Acme.Catalog.Import.CmdInfra . Arguments#GetVariableValue`1(string, Acme.Catalog.Import.CmdInfra.ArgumentValidator<T>).",
+            "GetVariableValue",
+        ),
+        ("csharp . . . Namespace.TopLevel", "TopLevel"),
+        ("csharp App . MyService#", "MyService"),
+        ("csharp Ns.Sub . Class#_field", "_field"),
+        // Generic TYPE arity lives on the type segment — stripped too, not
+        // just the method-side backtick.
+        ("csharp Ns . List`1#", "List"),
+    ];
+    for (key, expected) in cases {
+        assert_eq!(
+            super::csharp::extract_simple_name(key),
+            expected,
+            "key: {key}"
+        );
+    }
+}
