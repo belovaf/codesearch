@@ -528,7 +528,7 @@ pub enum Commands {
 
     /// Download embedding models
     Setup {
-        /// Model to download (defaults to mxbai-embed-xsmall-v1)
+        /// Model to download (defaults to minilm-l6-q)
         #[arg(long)]
         model: Option<String>,
     },
@@ -1821,8 +1821,9 @@ fn codesearch_hook_block() -> String {
 # Only react to branch/worktree checkouts ($3 = 1). `git worktree add` fires
 # post-checkout with flag 1; a file checkout (`git checkout -- path`) fires with
 # flag 0 and must not re-register (it changes no repo location, just wastes a POST).
-if [ "$3" = "1" ] && [ -f "$HOME/.codesearch/serve_url" ]; then
-    __cs_url=$(cat "$HOME/.codesearch/serve_url")
+__cs_home="${CODESEARCH_HOME:-$HOME/.codesearch}"
+if [ "$3" = "1" ] && [ -f "$__cs_home/serve_url" ]; then
+    __cs_url=$(cat "$__cs_home/serve_url")
     if [ -n "$__cs_url" ]; then
         # Git Bash `pwd` yields an msys path (/c/...) that codesearch serve
         # cannot canonicalize (HTTP 400); `pwd -W` yields a native C:/ path.
@@ -2056,6 +2057,21 @@ mod tests {
         assert!(
             block.contains("[ \"$3\" = \"1\" ]"),
             "hook must gate on the branch-checkout flag"
+        );
+    }
+
+    #[test]
+    fn test_hook_block_resolves_serve_url_via_codesearch_home() {
+        let block = codesearch_hook_block();
+        // serve_url lives under the relocatable global root: the hook must
+        // fall back through CODESEARCH_HOME, mirroring codesearch_home().
+        assert!(
+            block.contains("${CODESEARCH_HOME:-$HOME/.codesearch}"),
+            "hook must honour CODESEARCH_HOME before ~/.codesearch"
+        );
+        assert!(
+            !block.contains("$HOME/.codesearch/serve_url"),
+            "no direct ~/.codesearch/serve_url path may remain"
         );
     }
 
