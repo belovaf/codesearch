@@ -14,6 +14,18 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.5.1] - 2026-10-04
+
+### Added
+
+- **`codesearch setup` — download embedding models, and a relocatable global root via `CODESEARCH_HOME`.** The stubbed setup command now resolves `--model` through the shared model parser (unknown names error with the valid list), downloads into the global models cache with a visible progress bar (runtime paths stay silent), and probe-embeds one query so a broken download fails in setup instead of mid-indexing. `CODESEARCH_HOME` relocates the entire global root (repos.json, models cache, logs, serve_url, global ignore/extensions) and is honoured by the hub, db-discovery, every Claude Code guard hook and the OpenCode plugin, with tests pinning each layer. *(Contributed by @belovaf in #298 — in the same PR: find-impact warnings that no longer promise rebuilds nothing will run, group-fan-out hits attributed to their repo, and dependency-lockfile indexing exclusions.)*
+
+*A big thank-you to belovaf ([@belovaf](https://github.com/belovaf)) for his first contribution to this release — a careful, well-tested feature plus four quality fixes landed in one go.*
+
+### Fixed
+
+- **Queued reindexes are no longer cancelled as "leaked", and an unjoinable index task can no longer wedge a hub.** With the process-wide job gate (`CODESEARCH_INDEX_JOBS=1`, the default), tasks queued behind a long-running job held their `active_reindexes` markers past `MAX_INDEXING_SECS` without renewing them, so the lazy stale-marker check evicted the markers and cancelled the parked tasks — leaving empty stores and in-process LMDB handles that made later writes fail with "Database is locked by another process" until a serve restart. Separately, `await_index_task` removed the task entry *before* waiting and dropped the `JoinHandle` on timeout, so a task too deep in the uninterruptible `build_index` to cancel kept its `Arc<SharedStores>` and the single job permit invisibly; the job-gate wait ignored cancellation, parking cancelled tasks on the gate; and `remove_repo` / format recovery could delete the DB directory out from under a still-running task. Now: a marker backed by a live tracked `Reindex` task is renewed (with a throttled wedge warning) instead of reaped; gate acquisition is cancellation-aware (`JobAcquire`) so cancelled or removed queued jobs abort and release their stores; a task that cannot be joined stays tracked and is reaped by a periodic sweeper that also deletes orphaned DB directories and re-asserts cancellation for removed repos; DB deletion is deferred while the task runs; format recovery refuses to wipe in that state; and stale markers from other owners are still evicted.
+
 ## [1.5.0] - 2026-10-03
 
 ### Added
@@ -353,6 +365,8 @@ finalized in place with a date — no renaming/migration step needed.
 
 ## [1.0.72] - 2026-05-01
 - Initial multi-repo release: multi-repo `serve` (HTTP/SSE, per-project/group routing, RRF cross-repo search), stdio MCP proxy with client-side auto-reconnect, tree-sitter chunking (9 langs), persistent SHA-256 embedding cache, repository groups, re-tuned RRF, and LMDB resize crash fix (#30, `MDB_MAP_FULL`).
+
+[1.5.1]: https://github.com/flupkede/codesearch/compare/v1.5.0...v1.5.1
 
 [1.5.0]: https://github.com/flupkede/codesearch/compare/v1.4.9...v1.5.0
 
