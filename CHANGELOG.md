@@ -14,6 +14,12 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
+## [1.5.2]
+
+### Fixed
+
+- **C# symbol indexing restores packages before the workspace load, and NuGet audit advisories no longer count as index warnings.** The design-time load does not restore: with stale or missing `project.assets.json`, package-typed references collapsed into CS0246 cascades that flagged whole solution families as degraded (⚠ in the serve TUI) even though `dotnet build` succeeds. The helper now runs `dotnet restore` before opening the solution (bounded, best effort — a failed restore logs and continues, degraded indexing beats no indexing), and NuGet vulnerability advisories surfacing as Msbuild "failures" are filtered from the warning channel: they are security notes for the product, not index-health signals. Compiler *warnings* were already never counted; genuine project compilation errors still are, and indexing stays as complete as the broken projects allow.
+
 ## [1.5.1] - 2026-10-04
 
 ### Added
