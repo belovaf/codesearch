@@ -29,6 +29,7 @@
     <Compile Include="..\OutputWriter.cs" Link="OutputWriter.cs" />
     <Compile Include="..\SymbolIndexer.cs" Link="SymbolIndexer.cs" />
     <Compile Include="..\WorkspaceLoad.cs" Link="WorkspaceLoad.cs" />
+    <Compile Include="..\WorkspaceNoise.cs" Link="WorkspaceNoise.cs" />
   </ItemGroup>
 
   <!-- Exclude fixture source files from compilation -->

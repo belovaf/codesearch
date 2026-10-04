@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using Microsoft.Build.Locator;
 using Microsoft.CodeAnalysis.MSBuild;
@@ -323,8 +324,67 @@ public static class Program
 
         var workspace = MSBuildWorkspace.Create(properties);
         workspace.WorkspaceFailed += (_, e) =>
+        {
+            // NuGet's vulnerability audit surfaces as an Msbuild "failure" but
+            // is a security advisory, not a load failure — the index is
+            // unaffected and emitting it would pin the repo's index warning
+            // until the package is bumped.
+            if (WorkspaceNoise.IsNuGetAuditNoise(e.Diagnostic?.Message))
+            {
+                return;
+            }
             Console.Error.WriteLine($"[WARN] Workspace error: {e.Diagnostic}");
+        };
         return workspace;
+    }
+
+    /// <summary>
+    /// Restores the solution before the design-time load. MSBuildWorkspace
+    /// does not restore: with stale or missing obj/project.assets.json,
+    /// package-typed references fail to resolve and the load drowns in CS0246
+    /// cascades even though `dotnet build` (which restores first) succeeds.
+    /// Best effort: a failed or missing `dotnet` is logged and the load
+    /// proceeds — degraded indexing beats no indexing.
+    /// </summary>
+    private static void RestoreSolution(string solutionPath)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = "dotnet",
+                Arguments = $"restore \"{solutionPath}\" --nologo -v q",
+                RedirectStandardError = true,
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+            };
+            using var process = Process.Start(psi);
+            if (process is null)
+            {
+                return;
+            }
+            // Bounded: a hung restore (unreachable feed) must not stall the
+            // index indefinitely. 5 minutes is generous even for a cold sln.
+            if (!process.WaitForExit(300_000))
+            {
+                process.Kill(entireProcessTree: true);
+                Console.Error.WriteLine(
+                    "[WARN] dotnet restore did not finish within 300s — killed; continuing, " +
+                    "package references may be unresolved (degraded symbols).");
+                return;
+            }
+            if (process.ExitCode != 0)
+            {
+                Console.Error.WriteLine(
+                    $"[WARN] dotnet restore exited {process.ExitCode} for '{solutionPath}' — continuing; " +
+                    "package references may be unresolved (degraded symbols).");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(
+                $"[WARN] dotnet restore could not start ({ex.GetType().Name}: {ex.Message}) — continuing without it.");
+        }
     }
 
     // ── Solution filtering ───────────────────────────────────────────
@@ -338,6 +398,10 @@ public static class Program
     /// </summary>
     private static async Task OpenSolutionFilteredAsync(MSBuildWorkspace workspace, string solutionPath)
     {
+        // Restore first: the design-time build below does not restore, and
+        // stale/missing package assets cascade into CS0246 noise that would
+        // otherwise pin the repo's index warning.
+        RestoreSolution(solutionPath);
         var solutionDir = Path.GetDirectoryName(solutionPath) ?? ".";
         var lines = await File.ReadAllLinesAsync(solutionPath).ConfigureAwait(false);
 
