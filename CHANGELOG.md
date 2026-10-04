@@ -14,7 +14,7 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
-## [1.5.1]
+## [1.5.1] - 2026-10-04
 
 ### Added
 
@@ -365,6 +365,8 @@ finalized in place with a date — no renaming/migration step needed.
 
 ## [1.0.72] - 2026-05-01
 - Initial multi-repo release: multi-repo `serve` (HTTP/SSE, per-project/group routing, RRF cross-repo search), stdio MCP proxy with client-side auto-reconnect, tree-sitter chunking (9 langs), persistent SHA-256 embedding cache, repository groups, re-tuned RRF, and LMDB resize crash fix (#30, `MDB_MAP_FULL`).
+
+[1.5.1]: https://github.com/flupkede/codesearch/compare/v1.5.0...v1.5.1
 
 [1.5.0]: https://github.com/flupkede/codesearch/compare/v1.4.9...v1.5.0
 
