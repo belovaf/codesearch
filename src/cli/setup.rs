@@ -4,19 +4,11 @@ use crate::embed::ModelType;
 
 /// Resolve the CLI `--model` argument to a [`ModelType`].
 ///
-/// `None` falls back to the default model; unknown names are rejected with the
-/// full valid-model list so the error is self-explanatory. Pure and
-/// network-free, so it is unit-testable.
+/// Thin setup-specific wrapper over [`super::parse_model_arg`]: setup wants
+/// the default model when the flag is absent, where other commands keep
+/// `None` for per-query resolution.
 fn resolve_model(model: Option<&str>) -> Result<ModelType> {
-    match model {
-        Some(name) => ModelType::parse(name).ok_or_else(|| {
-            anyhow!(
-                "Unknown model '{name}' (valid models: {})",
-                ModelType::valid_short_names()
-            )
-        }),
-        None => Ok(ModelType::default()),
-    }
+    Ok(super::parse_model_arg(model)?.unwrap_or_default())
 }
 
 pub async fn run(model: Option<String>) -> Result<()> {
