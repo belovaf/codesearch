@@ -391,8 +391,14 @@ pub struct LiteralSearchResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_promoted_to_regex: Option<bool>,
 
-    /// Actionable note for the LLM caller (present iff auto_promoted_to_regex
-    /// or low_confidence is set).
+    /// True when the exact AND pass matched nothing and these results come
+    /// from the relaxed OR fallback: every kept hit covers >=60% of the
+    /// query's significant (non-stopword) terms, at least two of them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relaxed_fallback: Option<bool>,
+
+    /// Actionable note for the LLM caller (present iff auto_promoted_to_regex,
+    /// relaxed_fallback or low_confidence is set).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
 

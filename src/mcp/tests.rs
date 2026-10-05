@@ -1957,6 +1957,7 @@ fn test_literal_response_json_has_lc_fields() {
     let response = super::LiteralSearchResponse {
         results: vec![],
         auto_promoted_to_regex: None,
+        relaxed_fallback: None,
         note: None,
         low_confidence: Some(true),
         suggested_tool: Some("search with mode='semantic'".to_string()),
@@ -1972,6 +1973,7 @@ fn test_literal_response_json_omits_lc_fields_when_none() {
     let response = super::LiteralSearchResponse {
         results: vec![],
         auto_promoted_to_regex: None,
+        relaxed_fallback: None,
         note: None,
         low_confidence: None,
         suggested_tool: None,
@@ -2120,6 +2122,7 @@ fn test_literal_search_response_shape_json() {
             signature: None,
         }],
         auto_promoted_to_regex: None,
+        relaxed_fallback: None,
         note: None,
         low_confidence: None,
         suggested_tool: None,
@@ -2136,6 +2139,7 @@ fn test_literal_search_response_carries_note_when_promoted() {
     let response = super::LiteralSearchResponse {
         results: vec![],
         auto_promoted_to_regex: Some(true),
+        relaxed_fallback: None,
         note: Some("auto-promoted".to_string()),
         low_confidence: None,
         suggested_tool: None,
@@ -2725,6 +2729,7 @@ fn literal_response_emits_warnings_and_omits_them_when_healthy() {
     let failed = super::LiteralSearchResponse {
         results: vec![],
         auto_promoted_to_regex: None,
+        relaxed_fallback: None,
         note: None,
         low_confidence: None,
         suggested_tool: None,
@@ -2739,6 +2744,7 @@ fn literal_response_emits_warnings_and_omits_them_when_healthy() {
     let healthy = super::LiteralSearchResponse {
         results: vec![],
         auto_promoted_to_regex: None,
+        relaxed_fallback: None,
         note: None,
         low_confidence: None,
         suggested_tool: None,
@@ -2753,6 +2759,7 @@ fn test_literal_search_response_omits_fields_when_not_promoted() {
     let response = super::LiteralSearchResponse {
         results: vec![],
         auto_promoted_to_regex: None,
+        relaxed_fallback: None,
         note: None,
         low_confidence: None,
         suggested_tool: None,
@@ -2776,6 +2783,7 @@ fn test_grep_format_includes_comment_when_promoted() {
             signature: None,
         }],
         auto_promoted_to_regex: Some(true),
+        relaxed_fallback: None,
         note: None,
         low_confidence: None,
         suggested_tool: None,
@@ -2810,6 +2818,7 @@ fn test_grep_format_no_comment_when_plain() {
             signature: None,
         }],
         auto_promoted_to_regex: None,
+        relaxed_fallback: None,
         note: None,
         low_confidence: None,
         suggested_tool: None,

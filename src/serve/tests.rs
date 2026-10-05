@@ -4388,3 +4388,144 @@ async fn group_literal_search_attributes_each_hit_to_its_origin_repo() {
         "the bankruptcy hit must carry bankruptcy's own content: {text}"
     );
 }
+
+/// Exact-AND literal search returns silence for multi-word queries whose
+/// relevant chunks hold only MOST of the terms. The relaxed fallback must
+/// surface those partial hits (>=60% significant-term coverage, >=2 terms)
+/// instead of an empty answer, flag `relaxed_fallback` and explain itself
+/// in the note — while single-identifier queries keep their honest refusal.
+#[tokio::test]
+async fn group_literal_search_relaxed_fallback_covers_partial_term_hits() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("partial");
+    std::fs::create_dir_all(&root).unwrap();
+    {
+        let db_path = root.join(DB_DIR_NAME);
+        std::fs::create_dir_all(&db_path).unwrap();
+        std::fs::write(
+            db_path.join("metadata.json"),
+            r#"{"schema_version":1,"dimensions":2,"model_short_name":"minilm-l6-q"}"#,
+        )
+        .unwrap();
+        let stores = crate::index::SharedStores::new(&db_path, 2).expect("shared stores");
+        {
+            let mut vs = stores.vector_store.write().await;
+            let rich = crate::chunker::Chunk::new(
+                "create package documents quickly".to_string(),
+                0,
+                3,
+                crate::chunker::ChunkKind::Comment,
+                "docs/create.md".to_string(),
+            );
+            let poor = crate::chunker::Chunk::new(
+                "package".to_string(),
+                0,
+                1,
+                crate::chunker::ChunkKind::Comment,
+                "docs/other.md".to_string(),
+            );
+            vs.insert_chunks(vec![
+                crate::embed::EmbeddedChunk::new(rich, vec![0.25, 0.75]),
+                crate::embed::EmbeddedChunk::new(poor, vec![0.5, 0.5]),
+            ])
+            .expect("insert chunks");
+            vs.build_index().expect("build index");
+        }
+        {
+            let mut fts = stores.fts_store.write().await;
+            fts.add_chunk(
+                0,
+                "create package documents quickly",
+                "docs/create.md",
+                None,
+                "Comment",
+            )
+            .expect("fts doc");
+            fts.add_chunk(1, "package", "docs/other.md", None, "Comment")
+                .expect("fts doc");
+            fts.commit().expect("fts commit");
+        }
+        drop(stores);
+    }
+
+    let mut config = ReposConfig::default();
+    config
+        .register_with_alias(root.clone(), Some("partial".to_string()))
+        .unwrap();
+    config.groups.insert("solo".to_string(), vec!["partial".to_string()]);
+    let config_file = tmp.path().join("repos.json");
+    config.save_to(&config_file).unwrap();
+    let state = std::sync::Arc::new(ServeState::new(config, Some(config_file)));
+    let service = crate::mcp::CodesearchService::new_for_serve(state).unwrap();
+
+    // Four significant terms; no chunk holds all four, so exact AND is empty.
+    // The rich chunk covers 3/4 (>=60%), the poor one 1/4 (<2 terms).
+    let request = crate::mcp::types::LiteralSearchRequest {
+        query: "create package documents signature".to_string(),
+        regex: None,
+        phrase: None,
+        limit: Some(10),
+        file_glob: None,
+        language: None,
+        format: None,
+        project: None,
+        group: Some("solo".to_string()),
+    };
+    let res = service
+        .literal_search(Parameters(request))
+        .await
+        .expect("relaxed literal search must succeed");
+    let text = tool_text(&res);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|_| panic!("non-JSON answer: {text}"));
+    let items = parsed["results"]
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| panic!("expected a results array, got: {text}"));
+    assert_eq!(
+        items.len(),
+        1,
+        "only the >=60%-coverage chunk survives the relaxed gate: {text}"
+    );
+    assert_eq!(items[0]["path"], "partial/docs/create.md", "got: {text}");
+    assert_eq!(
+        parsed["relaxed_fallback"],
+        serde_json::json!(true),
+        "the fallback must be visible to the caller: {text}"
+    );
+    assert!(
+        parsed["note"].as_str().unwrap_or_default().contains("relaxed"),
+        "the note must explain the mode: {text}"
+    );
+
+    // A single-identifier query never relaxes: the empty exact answer stays
+    // an honest refusal, not a wall of partial matches.
+    let request = crate::mcp::types::LiteralSearchRequest {
+        query: "QzMissingUvzBusinessSymbol99Xy".to_string(),
+        regex: None,
+        phrase: None,
+        limit: Some(10),
+        file_glob: None,
+        language: None,
+        format: None,
+        project: None,
+        group: Some("solo".to_string()),
+    };
+    let res = service
+        .literal_search(Parameters(request))
+        .await
+        .expect("refusal literal search must succeed");
+    let text = tool_text(&res);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|_| panic!("non-JSON answer: {text}"));
+    assert!(
+        parsed["results"].as_array().map(Vec::is_empty).unwrap_or(true),
+        "an unknown identifier must stay empty: {text}"
+    );
+    assert!(
+        parsed.get("relaxed_fallback").is_none(),
+        "single-term queries must not trigger the fallback: {text}"
+    );
+}

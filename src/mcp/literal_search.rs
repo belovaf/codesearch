@@ -76,6 +76,13 @@ impl CodesearchService {
             && (!regex_has_anchorable_token(&effective_query)
                 || regex_has_disjunctive_or(&effective_query));
 
+        // Relaxed-fallback state, visible to both the scan and BM25 branches
+        // (the scan path never sets it). Terms are taken from the effective
+        // query; when regex auto-promotion rewrites it the fallback trigger
+        // is disabled anyway, so the exactness of bm25_query does not matter.
+        let significant_terms = significant_query_terms(&effective_query);
+        let mut relaxed_fallback = false;
+
         let mut items: Vec<LiteralSearchResultItem> = if tokenless_regex {
             // ── Scan path ──────────────────────────────────────────────
             // Tokenless regex (e.g. \bfn\s+\w+) — BM25 cannot produce useful
@@ -228,7 +235,7 @@ impl CodesearchService {
             } else {
                 effective_query.clone()
             };
-            let fts_results = if let Some(ref sv) = ctx.stores_vec {
+            let mut fts_results = if let Some(ref sv) = ctx.stores_vec {
                 let sa = ctx.store_aliases.as_ref().unwrap();
                 let outcome = self
                     .with_fts_store_read_multi(
@@ -280,6 +287,63 @@ impl CodesearchService {
                 }
             };
 
+            // Relaxed fallback. The exact AND pass returns silence for
+            // multi-word business queries whose relevant chunks hold only
+            // MOST of the terms. When it matches nothing, retry as a
+            // disjunction and keep candidates covering >=60% of the query's
+            // significant (non-stopword) terms, at least two of them.
+            // Single-term queries never relax: an empty exact answer stays
+            // an honest refusal instead of a wall of partial matches.
+            if !regex_enabled
+                && !request.phrase.unwrap_or(false)
+                && fts_results.is_empty()
+                && significant_terms.len() >= 2
+            {
+                tracing::debug!(
+                    "literal_search: exact AND empty for {} significant terms, retrying relaxed OR",
+                    significant_terms.len()
+                );
+                fts_results = if let Some(ref sv) = ctx.stores_vec {
+                    let sa = ctx.store_aliases.as_ref().unwrap();
+                    let outcome = self
+                        .with_fts_store_read_multi(
+                            |fts_store| fts_store.search_relaxed(&bm25_query, limit * 3),
+                            sv.clone(),
+                            sa,
+                        )
+                        .await
+                        .unwrap_or_default();
+                    for (alias, err) in &outcome.failures {
+                        let msg = format!("repo '{alias}' relaxed search failed: {err}");
+                        tracing::error!("MCP: {}", msg);
+                        literal_warnings.push(msg);
+                    }
+                    outcome.results
+                } else {
+                    match self
+                        .with_fts_store_read_for(
+                            |fts_store| fts_store.search_relaxed(&bm25_query, limit * 3),
+                            ctx.stores.clone(),
+                        )
+                        .await
+                    {
+                        Ok(r) => {
+                            let alias =
+                                ctx.project_alias.clone().unwrap_or_else(|| "local".to_string());
+                            r.into_iter()
+                                .map(|hit| SourcedResult::new(alias.clone(), hit))
+                                .collect()
+                        }
+                        Err(e) => {
+                            return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                                "Error searching: {e:#}"
+                            ))]));
+                        }
+                    }
+                };
+                relaxed_fallback = true;
+            }
+
             // Resolve chunk metadata and apply post-filters
             if let Some(ref sv) = ctx.stores_vec {
                 // Multi-store: resolve chunks from all stores
@@ -312,6 +376,11 @@ impl CodesearchService {
                         note_store_failure(&mut literal_warnings, sa, origin_idx, "chunk lookup", e);
                     }
                     if let Some(chunk) = looked_up.ok().flatten() {
+                        if relaxed_fallback
+                            && !chunk_covers_significant_terms(&chunk.content, &significant_terms)
+                        {
+                            continue 'outer;
+                        }
                         if let Some(ref lang) = lang_filter {
                             let file_lang =
                                 Language::from_path(std::path::Path::new(&chunk.path));
@@ -383,6 +452,14 @@ impl CodesearchService {
                                     Some((chunk, score))
                                 })
                                 .filter(|(chunk, _)| {
+                                    if relaxed_fallback
+                                        && !chunk_covers_significant_terms(
+                                            &chunk.content,
+                                            &significant_terms,
+                                        )
+                                    {
+                                        return false;
+                                    }
                                     if let Some(ref lang) = lang_filter {
                                         let file_lang =
                                             Language::from_path(std::path::Path::new(&chunk.path));
@@ -468,6 +545,11 @@ impl CodesearchService {
                  The query contained code-like punctuation that BM25 would tokenize incorrectly.",
                 request.query, effective_query
             ))
+        } else if relaxed_fallback {
+            Some(format!(
+                "Exact AND search matched nothing; showing relaxed OR results covering >=60% of the significant terms ({}) and at least two of them.",
+                significant_terms.join(", ")
+            ))
         } else if low_confidence == Some(true) {
             suggested_tool.as_ref().map(|tool| {
                 format!(
@@ -482,6 +564,7 @@ impl CodesearchService {
         let response = LiteralSearchResponse {
             results: items,
             auto_promoted_to_regex: if auto_promoted { Some(true) } else { None },
+            relaxed_fallback: if relaxed_fallback { Some(true) } else { None },
             note,
             low_confidence,
             suggested_tool: if low_confidence == Some(true) {
@@ -516,6 +599,12 @@ impl CodesearchService {
                         .to_string(),
                 );
             }
+            if response.relaxed_fallback == Some(true) {
+                lines.push(
+                    "# exact AND matched nothing — relaxed OR fallback (>=60% term coverage)"
+                        .to_string(),
+                );
+            }
             if response.low_confidence == Some(true) {
                 if let Some(ref hint) = response.suggested_tool {
                     lines.push(format!("# low confidence — consider: {}", hint));
@@ -534,4 +623,50 @@ impl CodesearchService {
 
         Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
     }
+}
+
+/// Function words that carry no retrieval signal. Dropped before relaxed
+/// coverage accounting so natural-language questions are judged by their
+/// domain terms — otherwise "на кого ставится задача по ..." needs a chunk
+/// containing "на" and "по" to reach the 60% bar.
+const LITERAL_STOPWORDS: &[&str] = &[
+    "и", "в", "во", "с", "со", "к", "у", "о", "об", "от", "до", "из", "за", "на", "по", "для",
+    "как", "что", "кто", "кого", "кому", "чем", "чему", "где", "когда", "или", "же", "бы", "ли",
+    "а", "но", "да", "это", "этот", "эта", "эти", "там", "так", "такой", "тоже", "уже", "еще",
+    "ещё", "был", "была", "быть", "есть", "the", "a", "an", "of", "to", "in", "on", "for", "and",
+    "or", "is", "are", "was", "were", "be", "been", "with", "from", "by", "at", "as", "that",
+    "this", "it", "its", "there",
+];
+
+/// Split a query into deduplicated lowercase terms the same way the FTS
+/// analyzer would (SimpleTokenizer splits on non-alphanumeric boundaries),
+/// dropping stopwords. This is the matched set and denominator for relaxed
+/// coverage.
+fn significant_query_terms(query: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut terms = Vec::new();
+    for raw in query.split(|c: char| !c.is_alphanumeric()) {
+        let term = raw.to_lowercase();
+        if term.is_empty() || LITERAL_STOPWORDS.contains(&term.as_str()) {
+            continue;
+        }
+        if seen.insert(term.clone()) {
+            terms.push(term);
+        }
+    }
+    terms
+}
+
+/// Relaxed-fallback gate: a candidate counts only when it holds at least two
+/// distinct significant terms and covers >=60% of them.
+fn chunk_covers_significant_terms(content: &str, terms: &[String]) -> bool {
+    if terms.len() < 2 {
+        return false;
+    }
+    let tokens: std::collections::HashSet<String> = content
+        .split(|c: char| !c.is_alphanumeric())
+        .map(str::to_lowercase)
+        .collect();
+    let matched = terms.iter().filter(|t| tokens.contains(*t)).count();
+    matched >= 2 && matched * 10 >= terms.len() * 6
 }

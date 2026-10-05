@@ -574,6 +574,39 @@ impl FtsStore {
         self.collect_fts_results(top_docs)
     }
 
+    /// Disjunction (OR) search over the same fields as [`FtsStore::search`].
+    ///
+    /// Used by the literal relaxed fallback: when the exact AND pass matches
+    /// nothing, candidates holding only PART of the query terms are still
+    /// worth surfacing. The caller filters them by term coverage afterwards —
+    /// raw OR ranking alone would drown precise queries in noise, which is
+    /// why `search` stays conjunctive by default.
+    pub fn search_relaxed(&self, query: &str, limit: usize) -> Result<Vec<FtsResult>> {
+        let searcher = self.reader.searcher();
+
+        let mut query_parser = QueryParser::for_index(
+            &self.index,
+            vec![self.content_field, self.signature_field, self.kind_field],
+        );
+        query_parser.set_field_boost(self.signature_field, 2.0);
+
+        let parsed_query = match query_parser.parse_query(query) {
+            Ok(q) => q,
+            Err(_) => {
+                let escaped = query.replace(
+                    [':', '(', ')', '[', ']', '{', '}', '^', '"', '~', '*', '?', '\\', '/'],
+                    " ",
+                );
+                query_parser.parse_query(&escaped)?
+            }
+        };
+
+        let top_docs =
+            searcher.search(&parsed_query, &TopDocs::with_limit(limit).order_by_score())?;
+
+        self.collect_fts_results(top_docs)
+    }
+
     /// Search for exact identifier matches (boosted)
     ///
     /// Used for improving exact name matching (e.g., "BaseRestClient", "UserService").
