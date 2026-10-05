@@ -1553,25 +1553,7 @@ impl ServeState {
                     continue;
                 }
 
-                let cfg = match state.config.read() {
-                    Ok(c) => c.clone(),
-                    Err(e) => {
-                        tracing::warn!("repos persist skipped: config lock poisoned: {}", e);
-                        state.persist_deadline_unix_ms.store(0, Ordering::Relaxed);
-                        continue;
-                    }
-                };
-                // Route through persist_config so the override path is honored
-                // (keeps the metadata-persist worker hermetic in tests; identical
-                // to cfg.save() in production where the override is None).
-                let state_persist = state.clone();
-                let save_res =
-                    tokio::task::spawn_blocking(move || state_persist.persist_config(&cfg)).await;
-                match save_res {
-                    Ok(Ok(())) => tracing::debug!("repos.json metadata persisted"),
-                    Ok(Err(e)) => tracing::warn!("repos persist failed: {}", e),
-                    Err(e) => tracing::warn!("repos persist task join failed: {}", e),
-                }
+                state.run_persist_pass().await;
 
                 state.persist_deadline_unix_ms.store(0, Ordering::Relaxed);
                 state.persist_worker_started.store(false, Ordering::Release);
@@ -1589,6 +1571,66 @@ impl ServeState {
                 break;
             }
         });
+    }
+
+    /// One debounced-write pass over the in-memory repos config.
+    ///
+    /// The snapshot clone and the file write deliberately happen WITHOUT the
+    /// config lock (the write is blocking I/O), so a registration landing in
+    /// between exists only in memory while the stale snapshot lands on disk —
+    /// a lost update. `persist_config` adopting its own mtime already keeps
+    /// readers from clobbering memory with that stale file; this pass then
+    /// re-verifies memory against the persisted snapshot and rewrites until
+    /// they agree, so the disk converges too. Bounded: under a continuous
+    /// stream of mutations it gives up after a few passes and the next
+    /// scheduled pass picks up whatever remained.
+    async fn run_persist_pass(self: &Arc<Self>) {
+        const MAX_DIVERGENT_PASSES: usize = 5;
+        for attempt in 1..=MAX_DIVERGENT_PASSES {
+            let cfg = match self.config.read() {
+                Ok(c) => c.clone(),
+                Err(e) => {
+                    tracing::warn!("repos persist skipped: config lock poisoned: {}", e);
+                    return;
+                }
+            };
+            // Route through persist_config so the override path is honored
+            // (keeps the metadata-persist worker hermetic in tests; identical
+            // to cfg.save() in production where the override is None).
+            let state_pass = self.clone();
+            // Clone for the blocking write: `cfg` itself stays here for the
+            // post-write divergence check below.
+            let snapshot = cfg.clone();
+            let save_res =
+                tokio::task::spawn_blocking(move || state_pass.persist_config(&snapshot)).await;
+            match save_res {
+                Ok(Ok(())) => tracing::debug!("repos.json metadata persisted"),
+                Ok(Err(e)) => {
+                    tracing::warn!("repos persist failed: {}", e);
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!("repos persist task join failed: {}", e);
+                    return;
+                }
+            }
+            let diverged = match self.config.read() {
+                Ok(current) => *current != cfg,
+                // A poisoned lock says nothing about divergence; don't spin.
+                Err(_) => false,
+            };
+            if !diverged {
+                return;
+            }
+            tracing::warn!(
+                "repos.json diverged from memory during persist (pass {attempt}); rewriting"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        tracing::warn!(
+            "repos persist gave up after {MAX_DIVERGENT_PASSES} divergent passes; \
+             the next scheduled pass will rewrite"
+        );
     }
 
     /// Reconcile registered repo paths against the filesystem before warmup.
@@ -3486,9 +3528,28 @@ impl ServeState {
     /// assert on persistence without touching the user's real config.
     pub(crate) fn persist_config(&self, config: &ReposConfig) -> anyhow::Result<()> {
         match self.config_path_override.as_ref() {
-            Some(path) => config.save_to(path),
-            None => config.save(),
+            Some(path) => config.save_to(path)?,
+            None => config.save()?,
+        };
+        // Adopt this write's mtime so reload_if_changed never mistakes our own
+        // persist for an external edit of repos.json. Before this, every
+        // debounced or handler write left the stored mtime stale, the next
+        // reader (warmup / aliases / info / group resolve) reloaded the file we
+        // ourselves had just written, and registrations that had landed in
+        // memory after that snapshot were silently dropped — the pilot's
+        // "ghost loss" of freshly registered aliases.
+        let written_path = match self.config_path_override.as_ref() {
+            Some(p) => Some(p.clone()),
+            None => ReposConfig::path().ok(),
+        };
+        if let Some(path) = written_path {
+            if let Ok(mtime) = std::fs::metadata(path).and_then(|m| m.modified()) {
+                if let Ok(mut guard) = self.config_mtime.write() {
+                    *guard = Some(mtime);
+                }
+            }
         }
+        Ok(())
     }
 
     /// Resolve a group name to its constituent aliases.

@@ -4608,3 +4608,78 @@ async fn group_semantic_search_min_score_refuses_instead_of_returning_noise() {
         "the same query without a threshold must return its hits: {text}"
     );
 }
+
+/// Regression for the pilot's "ghost loss" of freshly registered aliases.
+///
+/// The debounced persist clones its snapshot and writes the file WITHOUT the
+/// config lock, so a registration landing in that window used to exist only
+/// in memory while the stale snapshot hit disk. Every reader-side
+/// `reload_if_changed` (warmup / aliases / info / group resolve) then saw the
+/// fresh mtime, trusted "the file changed", and swapped the stale disk copy
+/// into memory — silently dropping the registration (alias 404s in /info, its
+/// build ending with "repo removed or cancelled mid-index").
+///
+/// Two guards fix it: `persist_config` adopts its own write's mtime so an
+/// internal persist never masquerades as an external edit, and
+/// `run_persist_pass` re-verifies memory against the snapshot and rewrites
+/// until disk converges.
+#[tokio::test]
+async fn own_persist_never_clobbers_a_racing_registration() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root_a = tmp.path().join("alpha-repo");
+    let root_b = tmp.path().join("beta-repo");
+    std::fs::create_dir_all(&root_a).unwrap();
+    std::fs::create_dir_all(&root_b).unwrap();
+
+    let mut config = ReposConfig::default();
+    config
+        .register_with_alias(root_a.clone(), Some("alpha".to_string()))
+        .unwrap();
+    let config_file = tmp.path().join("repos.json");
+    config.save_to(&config_file).unwrap();
+    let state = std::sync::Arc::new(ServeState::new(config, Some(config_file.clone())));
+
+    // Warm the mtime cache exactly as production does after its first reader
+    // passes (ServeState starts with a None mtime; this reload adopts it).
+    let _ = state.aliases();
+
+    // The debounce worker clones its snapshot...
+    let stale = state.config.read().unwrap().clone();
+
+    // ...and a registration lands + persists while the worker is mid-write.
+    {
+        let mut cfg = state.config.write().unwrap();
+        cfg.register_with_alias(root_b.clone(), Some("beta".to_string()))
+            .unwrap();
+    }
+    let current = state.config.read().unwrap().clone();
+    state.persist_config(&current).unwrap();
+
+    // The worker's stale snapshot finally hits the file — on disk, beta is gone.
+    state.persist_config(&stale).unwrap();
+    let disk = ReposConfig::load_from(&config_file).unwrap();
+    assert!(
+        !disk.repos.contains_key("beta"),
+        "fixture premise: the stale snapshot must have won the disk race"
+    );
+
+    // Before the fix this reader-side reload saw the fresh mtime and clobbered
+    // the in-memory registration with the disk copy.
+    let aliases = state.aliases();
+    assert!(
+        aliases.iter().any(|a| a == "beta"),
+        "the in-memory registration must survive the worker's stale write"
+    );
+    assert!(
+        state.config_snapshot().repos.contains_key("beta"),
+        "beta must still resolve from the live config"
+    );
+
+    // The divergence check converges disk back to memory.
+    state.run_persist_pass().await;
+    let disk = ReposConfig::load_from(&config_file).unwrap();
+    assert!(
+        disk.repos.contains_key("beta"),
+        "run_persist_pass must rewrite the racing registration to disk"
+    );
+}
