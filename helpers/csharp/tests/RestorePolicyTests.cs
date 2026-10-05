@@ -103,4 +103,24 @@ public class RestorePolicyTests : IDisposable
             Environment.SetEnvironmentVariable(RestorePolicy.TimeoutEnvName, null);
         }
     }
+
+    /// <summary>
+    /// Pins the timeout contract: the wait expiring must announce a restore
+    /// that is STILL RUNNING in the background, never a killed one — a kill
+    /// would waste all of the restore's work and re-pay the same wait on
+    /// every subsequent reindex (the poison loop for the biggest solutions).
+    /// </summary>
+    [Fact]
+    public void TimeoutWarningAnnouncesBackgroundContinuationNeverAKill()
+    {
+        var warning = RestorePolicy.StillRunningWarning(300);
+
+        Assert.StartsWith("[WARN]", warning);
+        Assert.Contains("still running after 300s", warning);
+        Assert.Contains("background", warning);
+        Assert.Contains("next", warning);
+        Assert.Contains("fresh assets", warning);
+        Assert.DoesNotContain("killed", warning, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(RestorePolicy.TimeoutEnvName, warning);
+    }
 }
