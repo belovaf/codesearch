@@ -43,7 +43,7 @@ internal static class RestorePolicy
     }
 
     /// <summary>
-    /// Restore kill timeout in seconds: <c>CODESEARCH_RESTORE_TIMEOUT_SECS</c>
+    /// Restore wait timeout in seconds: <c>CODESEARCH_RESTORE_TIMEOUT_SECS</c>
     /// when set to a positive integer, otherwise 300. Unparseable values fall
     /// back to the default rather than failing the load.
     /// </summary>
@@ -56,4 +56,19 @@ internal static class RestorePolicy
         }
         return DefaultRestoreTimeoutSeconds;
     }
+
+    /// <summary>
+    /// The <c>[WARN]</c> line emitted when the bounded wait expires while
+    /// <c>dotnet restore</c> is still running. The restore is NOT killed: it
+    /// keeps running in the background (the child outlives the helper), this
+    /// load proceeds degraded, and the next reindex finds the fresh assets —
+    /// a killed restore would waste all of its work and re-pay the same wait
+    /// on every subsequent reindex. Pinned by test so a "killed" wording
+    /// cannot sneak back in.
+    /// </summary>
+    public static string StillRunningWarning(int seconds) =>
+        $"[WARN] dotnet restore still running after {seconds}s — proceeding without it " +
+        "(degraded symbols this run); it keeps running in the background and the next " +
+        "reindex picks up the fresh assets. " +
+        $"Raise with {TimeoutEnvName} if this solution legitimately needs longer.";
 }

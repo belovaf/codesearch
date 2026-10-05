@@ -356,7 +356,9 @@ public static class Program
     /// cascades even though `dotnet build` (which restores first) succeeds.
     /// Gated by <see cref="RestorePolicy.NeedsRestore"/>; best effort: a
     /// failed or missing `dotnet` is logged and the load proceeds — degraded
-    /// indexing beats no indexing.
+    /// indexing beats no indexing. The wait is bounded, but the restore is
+    /// never killed: on timeout it continues in the background and the next
+    /// reindex picks up the fresh assets.
     /// </summary>
     private static void RestoreSolution(string solutionPath)
     {
@@ -378,16 +380,21 @@ public static class Program
             {
                 return;
             }
-            // Bounded: a hung restore (unreachable feed) must not stall the
-            // index indefinitely. Timeout is env-tunable for large solutions
-            // on slow feeds.
+            // Drain both pipes in the background: the child inherits these
+            // handles, so without readers a chatty restore could block on a
+            // full pipe, and the serve process reads stderr until EOF.
+            _ = process.StandardOutput.ReadToEndAsync();
+            _ = process.StandardError.ReadToEndAsync();
+            // Bounded WAIT, never a kill: a killed restore wastes all of its
+            // work and leaves assets missing, so every reindex would pay the
+            // same wait and stay degraded. On timeout the restore keeps
+            // running in the background (the child outlives this process);
+            // this load proceeds degraded and the next reindex finds the
+            // fresh assets and loads clean. Timeout is env-tunable for large
+            // solutions on slow feeds.
             if (!process.WaitForExit(timeoutSeconds * 1000))
             {
-                process.Kill(entireProcessTree: true);
-                Console.Error.WriteLine(
-                    $"[WARN] dotnet restore did not finish within {timeoutSeconds}s — killed; continuing, " +
-                    "package references may be unresolved (degraded symbols). " +
-                    $"Raise with {RestorePolicy.TimeoutEnvName} if this solution legitimately needs longer.");
+                Console.Error.WriteLine(RestorePolicy.StillRunningWarning(timeoutSeconds));
                 return;
             }
             if (process.ExitCode != 0)
