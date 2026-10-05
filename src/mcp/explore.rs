@@ -101,8 +101,8 @@ impl CodesearchService {
                                     chunk_id: c.id,
                                     kind: c.kind,
                                     signature: c.signature,
-                                    start_line: c.start_line,
-                                    end_line: c.end_line,
+                                    start_line: c.start_line + 1,
+                                    end_line: c.end_line + 1,
                                 });
                             }
                         }
@@ -125,8 +125,8 @@ impl CodesearchService {
                             chunk_id: c.id,
                             kind: c.kind,
                             signature: c.signature,
-                            start_line: c.start_line,
-                            end_line: c.end_line,
+                            start_line: c.start_line + 1,
+                            end_line: c.end_line + 1,
                         })
                         .collect();
                     out.sort_by_key(|i| i.start_line);

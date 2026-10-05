@@ -1182,18 +1182,19 @@ fn test_match_line_for_literal_regex() {
 #[test]
 fn test_parse_import_lines_detects_common_forms() {
     let content = "use std::fs;\nimport os\nfrom pkg import thing\n#include <stdio.h>\nconst x = require('x')\nlet y = 1;";
+    // `10` is the chunk's 0-based first line; emitted lines are 1-based.
     let imports = super::parse_import_lines(content, 10);
     assert_eq!(imports.len(), 5);
     assert_eq!(imports[0].kind, "use");
-    assert_eq!(imports[0].line, 10);
+    assert_eq!(imports[0].line, 11);
     assert_eq!(imports[1].kind, "import");
-    assert_eq!(imports[1].line, 11);
+    assert_eq!(imports[1].line, 12);
     assert_eq!(imports[2].kind, "import");
-    assert_eq!(imports[2].line, 12);
+    assert_eq!(imports[2].line, 13);
     assert_eq!(imports[3].kind, "include");
-    assert_eq!(imports[3].line, 13);
+    assert_eq!(imports[3].line, 14);
     assert_eq!(imports[4].kind, "require");
-    assert_eq!(imports[4].line, 14);
+    assert_eq!(imports[4].line, 15);
 }
 
 // === Project/group routing tests ===

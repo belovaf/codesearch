@@ -322,8 +322,8 @@ impl CodesearchService {
         let response = GetChunkResponse {
             chunk_id: request.chunk_id,
             path: chunk.path,
-            start_line: chunk.start_line,
-            end_line: chunk.end_line,
+            start_line: chunk.start_line + 1,
+            end_line: chunk.end_line + 1,
             kind: chunk.kind,
             signature: chunk.signature,
             content: chunk.content,

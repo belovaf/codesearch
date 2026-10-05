@@ -4322,6 +4322,10 @@ async fn group_find_definition_attributes_hit_to_origin_repo_on_id_collision() {
         "the hit must carry its origin repo's alias prefix: {text}"
     );
     assert_eq!(items[0]["kind"], "Interface", "got: {text}");
+    assert_eq!(
+        items[0]["line"], 1,
+        "responses must emit 1-based editor lines (chunk starts at 0-based line 0): {text}"
+    );
 }
 
 #[tokio::test]
@@ -4490,6 +4494,10 @@ async fn group_literal_search_relaxed_fallback_covers_partial_term_hits() {
         "only the >=60%-coverage chunk survives the relaxed gate: {text}"
     );
     assert_eq!(items[0]["path"], "partial/docs/create.md", "got: {text}");
+    assert_eq!(
+        items[0]["start_line"], 1,
+        "responses must emit 1-based editor lines (chunk starts at 0-based line 0): {text}"
+    );
     assert_eq!(
         parsed["relaxed_fallback"],
         serde_json::json!(true),

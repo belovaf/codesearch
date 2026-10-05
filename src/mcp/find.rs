@@ -206,7 +206,7 @@ impl CodesearchService {
                         items.push(ReferenceItem {
                             chunk_id: fts_hit.result.chunk_id,
                             path: ctx.prefix_sourced_path(&fts_hit.alias, &chunk.path),
-                            line: chunk.start_line,
+                            line: chunk.start_line + 1,
                             kind: chunk.kind,
                             signature: chunk.signature,
                             score: fts_hit.result.score,
@@ -259,7 +259,7 @@ impl CodesearchService {
                                 Some(ReferenceItem {
                                     chunk_id,
                                     path: chunk.path,
-                                    line: chunk.start_line,
+                                    line: chunk.start_line + 1,
                                     kind: chunk.kind,
                                     signature: chunk.signature,
                                     score,
@@ -416,7 +416,7 @@ impl CodesearchService {
                             items.push(ReferenceItem {
                                 chunk_id: fts_hit.result.chunk_id,
                                 path: ctx.prefix_sourced_path(&fts_hit.alias, &chunk.path),
-                                line: chunk.start_line,
+                                line: chunk.start_line + 1,
                                 kind: chunk.kind,
                                 signature: chunk.signature,
                                 score: fts_hit.result.score,
@@ -463,7 +463,7 @@ impl CodesearchService {
                                 Some(ReferenceItem {
                                     chunk_id,
                                     path: chunk.path,
-                                    line: chunk.start_line,
+                                    line: chunk.start_line + 1,
                                     kind: chunk.kind,
                                     signature: chunk.signature,
                                     score,
