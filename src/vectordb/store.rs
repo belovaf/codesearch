@@ -120,7 +120,10 @@ fn read_metadata_u32(db_path: &Path, key: &str) -> Option<u32> {
 /// fail with "Access is denied" purely from timing, not a real conflict —
 /// most visible under `cargo test --lib --bins` parallel load. Unix renames
 /// are atomic replace and never hit this path, so the retry is a no-op there.
-fn is_transient_rename_error(e: &std::io::Error) -> bool {
+///
+/// `pub(crate)` so `FileMetaStore::save` can share the same classification
+/// for its rename step instead of growing a third copy of the raw-code list.
+pub(crate) fn is_transient_rename_error(e: &std::io::Error) -> bool {
     if let Some(raw) = e.raw_os_error() {
         if matches!(raw, 5 | 32 | 33) {
             return true;
@@ -132,9 +135,10 @@ fn is_transient_rename_error(e: &std::io::Error) -> bool {
 
 /// Bounded retry budget for the rename step below: short, since a genuine
 /// conflict (not a transient handle) should surface quickly rather than
-/// stall the caller.
-const RENAME_RETRY_ATTEMPTS: u32 = 5;
-const RENAME_RETRY_DELAY_MS: u64 = 20;
+/// stall the caller. Shared with `FileMetaStore::save`, which mirrors this
+/// tmp+fsync+rename pattern.
+pub(crate) const RENAME_RETRY_ATTEMPTS: u32 = 5;
+pub(crate) const RENAME_RETRY_DELAY_MS: u64 = 20;
 
 fn atomic_write_json(path: &Path, json: &serde_json::Value) -> Result<()> {
     use std::io::Write;
