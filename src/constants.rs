@@ -1032,6 +1032,9 @@ mod tests {
     }
 
     #[test]
+    // Reads global-path accessors that resolve via CODESEARCH_HOME: must not
+    // overlap the serial tests that set/clear that env var in this binary.
+    #[serial_test::serial]
     fn global_codesearchignore_path_returns_home_codesearch_dir() {
         let path = global_codesearchignore_path();
         assert!(path.is_some(), "Should return Some when home dir exists");
