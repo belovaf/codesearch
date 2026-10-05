@@ -30,6 +30,7 @@
     <Compile Include="..\SymbolIndexer.cs" Link="SymbolIndexer.cs" />
     <Compile Include="..\WorkspaceLoad.cs" Link="WorkspaceLoad.cs" />
     <Compile Include="..\WorkspaceNoise.cs" Link="WorkspaceNoise.cs" />
+    <Compile Include="..\RestorePolicy.cs" Link="RestorePolicy.cs" />
   </ItemGroup>
 
   <!-- Exclude fixture source files from compilation -->
