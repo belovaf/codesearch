@@ -264,6 +264,43 @@ async fn remove_repo_reports_db_locked_when_delete_fails() {
     );
 }
 
+#[tokio::test]
+async fn remove_repo_quarantines_db_dir_when_delete_budget_expires() {
+    // When the delete budget expires (external holder: another process, an
+    // AV scanner), the directory used to stay in place as a "valid" index —
+    // the next registration adopted its stale metadata and chunk stores as a
+    // false readiness, and re-registration against that legacy data ended in
+    // arroy EINVAL (the pilot's bare-stamp repos). The quarantine rename
+    // makes a fresh registration build from scratch; the quarantined sibling
+    // stays for manual cleanup, same convention as .codesearch.db.bak-*.
+    let (_tmp, repo_path, state) = state_with_repo("ghostrepo");
+    // db_path is a FILE: remove_dir_all fails every retry with a non-lock
+    // error, deterministically exhausting the budget branch on every OS.
+    let db_path = repo_path.join(DB_DIR_NAME);
+    std::fs::write(&db_path, "not a directory").unwrap();
+
+    let outcome = state
+        .remove_repo("ghostrepo")
+        .await
+        .expect("remove_repo returns Ok(outcome); delete failure is non-fatal");
+
+    assert!(!outcome.db_deleted);
+    let quarantine = outcome
+        .db_quarantined
+        .expect("a surviving db path must be quarantined, not left in place");
+    assert!(!db_path.exists(), "the original db path must be gone");
+    assert!(quarantine.exists(), "the quarantined sibling must exist");
+    assert!(
+        quarantine
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(".codesearch.db.removed-"),
+        "quarantine follows the <DB_DIR_NAME>.removed-* convention: {}",
+        quarantine.display()
+    );
+}
+
 #[test]
 fn remove_orphaned_db_dir_deletes_a_present_directory() {
     // Regression guard for the self-cleanup backstop: when a background

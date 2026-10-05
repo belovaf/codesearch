@@ -2249,6 +2249,10 @@ impl ServeState {
         // report honestly.
         let mut db_deleted = !db_path.exists();
         let mut db_delete_error: Option<String> = None;
+        // True when the DB dir's cleanup is owned by the still-running index
+        // task's post-build guard (or the sweeper) — the dir must stay in
+        // place for them, so step 4b must not quarantine it either.
+        let mut delete_deferred = false;
         if db_path.exists() && !index_task_exited {
             // The index task is still alive (typically parked in the
             // uninterruptible `build_index`). Deleting the directory out from
@@ -2266,6 +2270,7 @@ impl ServeState {
                 alias
             );
             db_delete_error = Some("index task still running; DB cleanup deferred".to_string());
+            delete_deferred = true;
         } else if db_path.exists() {
             // Deadline-bounded exponential-backoff retry. We ONLY retry on
             // lock-class errors (sharing/lock violation or access-denied on
@@ -2375,11 +2380,53 @@ impl ServeState {
             }
         }
 
+        // 4b. Quarantine fallback. If the retry budget expired with the
+        // directory still on disk (an external holder: another process, an AV
+        // scanner), leaving it in place silently resurrects a "valid" index on
+        // the next registration — metadata.json model stamps and stale chunk
+        // stores read as ready, fan-out then serves an empty or stale store,
+        // and re-registration against that mismatched legacy data ends in
+        // arroy EINVAL (the pilot's false-ready repos and its os-error-22
+        // wave). Renaming achieves DELETE's semantic goal atomically on unix:
+        // existing holders keep their open file descriptors until they exit,
+        // while a fresh registration sees no db dir at all and builds from
+        // scratch. The quarantined sibling stays for manual cleanup, same
+        // convention as the .codesearch.db.bak-* directories. Deferred
+        // cleanups (live index task) are excluded — their post-build guard
+        // owns the dir.
+        let mut db_quarantined: Option<PathBuf> = None;
+        if !db_deleted && !delete_deferred {
+            let sibling = db_path.with_file_name(format!(
+                "{}.removed-{}",
+                DB_DIR_NAME,
+                Self::now_unix_millis()
+            ));
+            match std::fs::rename(&db_path, &sibling) {
+                Ok(()) => {
+                    tracing::warn!(
+                        "Database dir for '{}' survived the delete budget; quarantined to {} \
+                         (safe to delete manually)",
+                        alias,
+                        sibling.display()
+                    );
+                    db_quarantined = Some(sibling);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to quarantine database dir for '{}' (kept in place): {}",
+                        alias,
+                        e
+                    );
+                }
+            }
+        }
+
         Ok(RepoRemovalOutcome {
             project_path,
             db_path,
             db_deleted,
             db_delete_error,
+            db_quarantined,
         })
     }
 
@@ -5632,6 +5679,12 @@ pub(crate) struct RepoRemovalOutcome {
     /// The last error from `remove_dir_all`. `Some` exactly when
     /// `db_deleted == false`; `None` once a delete succeeds.
     pub db_delete_error: Option<String>,
+    /// When the DB dir survived the delete budget it was renamed out of the
+    /// way (`<DB_DIR_NAME>.removed-<unix_ms>` sibling) so a fresh
+    /// registration builds from scratch instead of adopting the stale index.
+    /// `None` when the dir was deleted, never existed, or its cleanup is
+    /// deferred to a live index task's post-build guard.
+    pub db_quarantined: Option<PathBuf>,
 }
 
 /// Remove-repo handler: DELETE /repos/{alias}
@@ -5662,6 +5715,17 @@ async fn remove_repo_handler(
                     "Repo removed: FSW stopped, evicted from memory, unregistered, DB deleted"
                         .to_string(),
                 )
+            } else if let Some(quarantine) = &outcome.db_quarantined {
+                (
+                    "removed_db_quarantined",
+                    format!(
+                        "Repo removed: FSW stopped, evicted from memory, unregistered; \
+                         DB dir survived the delete budget and was quarantined to {} \
+                         (a fresh registration builds from scratch; delete it manually \
+                         when convenient)",
+                        quarantine.display()
+                    ),
+                )
             } else {
                 (
                     "removed_db_locked",
@@ -5684,6 +5748,7 @@ async fn remove_repo_handler(
                     "path": outcome.project_path,
                     "db_deleted": outcome.db_deleted,
                     "db_delete_error": outcome.db_delete_error,
+                    "db_quarantined": outcome.db_quarantined,
                     "message": message,
                 })),
             )
