@@ -6422,6 +6422,43 @@ pub async fn run_serve(
     #[cfg(unix)]
     raise_fd_limit(config.repos.len());
 
+    // Hook self-heal: upgrade codesearch-managed post-checkout blocks that
+    // were written by an OLDER binary (the pilot's 515 hooks kept the pre-fix
+    // `pwd`/serve_url bodies because nothing regenerated them — re-running
+    // `hooks git install` per repo by hand does not scale). Background and
+    // best-effort: only OUR block region is rewritten, a repo with no hook or
+    // a foreign hook is never touched, and failures never block startup.
+    let hook_repo_paths: Vec<PathBuf> = config.repos.values().cloned().collect();
+    tokio::spawn(async move {
+        let refreshed = tokio::task::spawn_blocking(move || {
+            let mut upgraded = 0usize;
+            let mut up_to_date = 0usize;
+            for repo_path in &hook_repo_paths {
+                match crate::cli::refresh_codesearch_post_checkout_hook(repo_path) {
+                    crate::cli::HookRefreshOutcome::Upgraded => upgraded += 1,
+                    crate::cli::HookRefreshOutcome::UpToDate => up_to_date += 1,
+                    crate::cli::HookRefreshOutcome::NotInstalled
+                    | crate::cli::HookRefreshOutcome::Foreign => {}
+                    crate::cli::HookRefreshOutcome::Failed(e) => warn!(
+                        "post-checkout hook refresh failed for {}: {}",
+                        repo_path.display(),
+                        e
+                    ),
+                }
+            }
+            (upgraded, up_to_date)
+        })
+        .await;
+        if let Ok((upgraded, up_to_date)) = refreshed {
+            if upgraded > 0 {
+                info!(
+                    "🪝 post-checkout hooks: {upgraded} upgraded to this binary, \
+                     {up_to_date} already up to date"
+                );
+            }
+        }
+    });
+
     // The explicit `--model` flag wins; otherwise adopt the choice persisted
     // by `codesearch setup`. Without this bridge the pilot operator had to
     // re-type `--model embeddinggemma-q4` on every serve launch: setup
