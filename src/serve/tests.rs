@@ -4537,3 +4537,74 @@ async fn group_literal_search_relaxed_fallback_covers_partial_term_hits() {
         "single-term queries must not trigger the fallback: {text}"
     );
 }
+
+/// `min_score` lets a caller turn the nearest-neighbour firehose into an
+/// honest refusal: hits below the threshold are dropped and the empty
+/// answer explains itself in `note`, instead of presenting irrelevant
+/// neighbours as if they were matches. Lexical mode rides the same
+/// `build_semantic_response` funnel as the embedding-backed modes, so it
+/// exercises the threshold without needing a real embedding model.
+#[tokio::test]
+async fn group_semantic_search_min_score_refuses_instead_of_returning_noise() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    let (_tmp, service) = colliding_group_fixture().await;
+
+    let make_request = |min_score: Option<f32>| crate::mcp::types::SearchRequest {
+        query: "BankruptcyFolderService".to_string(),
+        mode: None,
+        compact: None,
+        semantic_mode: Some("lexical".to_string()),
+        filter_path: None,
+        min_score,
+        regex: None,
+        phrase: None,
+        file_glob: None,
+        language: None,
+        format: None,
+        limit: Some(10),
+        project: None,
+        group: Some("uvz".to_string()),
+    };
+
+    // An unreachable threshold must refuse with an explanation, not return
+    // the (weakly scored) candidates it found.
+    let res = service
+        .search(Parameters(make_request(Some(10_000.0))))
+        .await
+        .expect("min_score search must succeed");
+    let text = tool_text(&res);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|_| panic!("non-JSON answer: {text}"));
+    assert!(
+        parsed["results"].as_array().map(Vec::is_empty).unwrap_or(false),
+        "an unreachable threshold must yield an explicit refusal: {text}"
+    );
+    assert_eq!(
+        parsed["low_confidence"],
+        serde_json::json!(true),
+        "a refusal is a low-confidence outcome: {text}"
+    );
+    assert!(
+        parsed["note"].as_str().unwrap_or_default().contains("min_score"),
+        "the refusal must name the threshold so the caller can retune it: {text}"
+    );
+
+    // Without the threshold the same query must still answer with hits:
+    // `min_score` adds a refusal path, never a silent filter.
+    let res = service
+        .search(Parameters(make_request(None)))
+        .await
+        .expect("unfiltered search must succeed");
+    let text = tool_text(&res);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|_| panic!("non-JSON answer: {text}"));
+    assert!(
+        !parsed["results"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .is_empty(),
+        "the same query without a threshold must return its hits: {text}"
+    );
+}

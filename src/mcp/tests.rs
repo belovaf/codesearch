@@ -382,6 +382,7 @@ fn test_low_confidence_response_serialization() {
         results: vec![],
         low_confidence: Some(true),
         suggested_tool: Some("literal_search".to_string()),
+        note: None,
         warnings: None,
     };
     let json = serde_json::to_string(&response).unwrap();
@@ -408,6 +409,7 @@ fn test_normal_response_omits_confidence_fields() {
         }],
         low_confidence: None,
         suggested_tool: None,
+        note: None,
         warnings: None,
     };
     let json = serde_json::to_string(&response).unwrap();
@@ -659,6 +661,7 @@ async fn group_lexical_search_attributes_each_hit_to_its_repo() {
         mode: Some("lexical".to_string()),
         project: None,
         group: Some("all".to_string()),
+        min_score: None,
     };
     let mut alias_roots = std::collections::HashMap::new();
     alias_roots.insert(
@@ -1133,6 +1136,7 @@ fn test_semantic_search_response_with_results() {
         }],
         low_confidence: None,
         suggested_tool: None,
+        note: None,
         warnings: None,
     };
     let json = serde_json::to_string(&response).unwrap();
@@ -1147,6 +1151,7 @@ fn test_semantic_search_response_empty_with_low_confidence() {
         results: vec![],
         low_confidence: Some(true),
         suggested_tool: Some("find_definition".to_string()),
+        note: None,
         warnings: None,
     };
     let json = serde_json::to_string(&response).unwrap();
@@ -2704,6 +2709,7 @@ fn semantic_response_emits_warnings_to_the_caller() {
         results: vec![],
         low_confidence: Some(true),
         suggested_tool: None,
+        note: None,
         warnings: Some(vec!["repo 'inriver' search failed: os error 22".to_string()]),
     };
     let json = serde_json::to_string(&response).unwrap();
@@ -2719,10 +2725,12 @@ fn semantic_response_omits_warnings_when_healthy() {
         results: vec![],
         low_confidence: None,
         suggested_tool: None,
+        note: None,
         warnings: None,
     };
     let json = serde_json::to_string(&response).unwrap();
     assert!(!json.contains("warnings"), "got: {json}");
+    assert!(!json.contains("note"), "got: {json}");
 }
 
 #[test]

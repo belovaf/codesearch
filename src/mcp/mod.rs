@@ -1649,6 +1649,7 @@ impl CodesearchService {
                         mode: request.semantic_mode.clone(),
                         project: None,
                         group: Some(group.clone()),
+                        min_score: None,
                     };
                     self.semantic_search(Parameters(req)).await?
                 }
@@ -1905,6 +1906,7 @@ impl CodesearchService {
             low_confidence: if items.is_empty() { Some(true) } else { None },
             results: items,
             suggested_tool: None,
+            note: None,
             warnings: if warnings.is_empty() {
                 None
             } else {

@@ -17,7 +17,7 @@ impl CodesearchService {
 
     /// Unified search tool — dispatches to semantic or literal search based on `mode`.
     #[tool(
-        description = "Unified code search. Set `mode` to choose the backend:\n\n- `semantic` (default): vector embeddings + BM25 FTS + exact-identifier boosting, fused with RRF. Best for conceptual queries, identifier lookups, and mixed natural-language + symbol queries.\n- `literal`: pure FTS, no embeddings. Fast and works without an embedding model. Sub-mode selection:\n  * Queries with operators, brackets, or punctuation (`foo = null`, `Vec<T>`, `return x;`, `a::b`) -> set `regex=true` and write the query as a regex. BM25 tokenizes on punctuation otherwise, producing noisy results.\n  * Multi-word exact phrases -> set `phrase=true`.\n  * Plain identifier lookups (`CodesearchService`) -> leave both false.\n\nFor semantic mode, optionally set `semantic_mode`: \"auto\" (default) | \"semantic\" | \"lexical\" | \"hybrid\".\nReturns metadata only by default (`compact=true`). Use `get_chunk` to read full code. Prefer `search(mode=\"literal\", regex=true)` over external grep/ripgrep for code patterns.\n\nIMPORTANT (multi-repo): always specify either `project` (single repo) or `group` (cross-repo). Omitting both in multi-repo mode returns a `scope_required` error with the list of available projects and groups. If the user has not indicated which repository to search, ask them to choose."
+        description = "Unified code search. Set `mode` to choose the backend:\n\n- `semantic` (default): vector embeddings + BM25 FTS + exact-identifier boosting, fused with RRF. Best for conceptual queries, identifier lookups, and mixed natural-language + symbol queries.\n- `literal`: pure FTS, no embeddings. Fast and works without an embedding model. Sub-mode selection:\n  * Queries with operators, brackets, or punctuation (`foo = null`, `Vec<T>`, `return x;`, `a::b`) -> set `regex=true` and write the query as a regex. BM25 tokenizes on punctuation otherwise, producing noisy results.\n  * Multi-word exact phrases -> set `phrase=true`.\n  * Plain identifier lookups (`CodesearchService`) -> leave both false.\n\nFor semantic mode, optionally set `semantic_mode`: \"auto\" (default) | \"semantic\" | \"lexical\" | \"hybrid\".\nSet `min_score` to drop weak hits and answer with an explicit refusal (empty results + note) instead of nearest-neighbour noise; the score scale depends on `semantic_mode` — cosine similarity for \"semantic\", RRF points (rarely above 0.2) otherwise.\nReturns metadata only by default (`compact=true`). Use `get_chunk` to read full code. Prefer `search(mode=\"literal\", regex=true)` over external grep/ripgrep for code patterns.\n\nIMPORTANT (multi-repo): always specify either `project` (single repo) or `group` (cross-repo). Omitting both in multi-repo mode returns a `scope_required` error with the list of available projects and groups. If the user has not indicated which repository to search, ask them to choose."
     )]
     pub(crate) async fn search(
         &self,
@@ -76,6 +76,7 @@ impl CodesearchService {
                     mode: request.semantic_mode,
                     project: request.project,
                     group: request.group,
+                    min_score: request.min_score,
                 };
                 self.semantic_search(Parameters(semantic_req)).await
             }
@@ -1105,7 +1106,7 @@ impl CodesearchService {
     #[allow(clippy::too_many_arguments)]
     fn build_semantic_response(
         &self,
-        results: Vec<crate::vectordb::SearchResult>,
+        mut results: Vec<crate::vectordb::SearchResult>,
         request: &SemanticSearchRequest,
         compact: bool,
         has_identifiers: bool,
@@ -1123,9 +1124,25 @@ impl CodesearchService {
         } else {
             Some(warnings.to_vec())
         };
+        // `min_score` turns nearest-neighbour noise into an honest refusal:
+        // weak hits are dropped before the response is built, so the empty
+        // arm below explains a deliberate threshold refusal instead of
+        // presenting the closest-but-irrelevant chunks as matches.
+        let hits_before_min_score = results.len();
+        if let Some(min_score) = request.min_score {
+            results.retain(|r| r.score >= min_score);
+        }
         if results.is_empty() {
+            let note = match (request.min_score, hits_before_min_score) {
+                (Some(min_score), n) if n > 0 => Some(format!(
+                    "{n} candidate hit(s) found but all scored below min_score {min_score:.3}; \
+                     refusing instead of returning the nearest neighbours."
+                )),
+                _ => None,
+            };
             let response = SemanticSearchResponse {
                 results: vec![],
+                note,
                 low_confidence: Some(true),
                 suggested_tool: retry_hint(Some("literal_search".to_string()), &warnings),
                 warnings,
@@ -1205,6 +1222,7 @@ impl CodesearchService {
             results: items,
             low_confidence,
             suggested_tool,
+            note: None,
             warnings,
         };
 
