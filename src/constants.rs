@@ -41,6 +41,13 @@ pub const CONFIG_DIR_NAME: &str = ".codesearch";
 /// Name of the file metadata database
 pub const FILE_META_DB_NAME: &str = "file_meta.json";
 
+/// Name of the persisted default-model choice in `<codesearch_home>/`.
+///
+/// Written by `codesearch setup`, adopted by `codesearch serve` when its own
+/// `--model` flag is absent — so an operator's setup choice survives across
+/// serve launches instead of being silently dropped.
+pub const DEFAULT_MODEL_FILE: &str = "default_model.json";
+
 /// Subdirectory name for embedding models within the global config dir
 const MODELS_SUBDIR: &str = "models";
 

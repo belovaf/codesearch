@@ -6422,6 +6422,47 @@ pub async fn run_serve(
     #[cfg(unix)]
     raise_fd_limit(config.repos.len());
 
+    // The explicit `--model` flag wins; otherwise adopt the choice persisted
+    // by `codesearch setup`. Without this bridge the pilot operator had to
+    // re-type `--model embeddinggemma-q4` on every serve launch: setup
+    // downloaded the model and then silently forgot the choice, so a bare
+    // `codesearch serve` built every NEW index with the built-in default.
+    let default_model = match default_model {
+        Some(flag) => Some(flag),
+        None => {
+            let persisted = crate::embed::load_default_model();
+            if let Some(model) = persisted {
+                let line = format!(
+                    "🧠 Default model from `codesearch setup`: {} ({} dims)",
+                    model.short_name(),
+                    model.dimensions()
+                );
+                info!("{}", line);
+                eprintln!("{}", line);
+                Some(model)
+            } else {
+                None
+            }
+        }
+    };
+
+    // Pre-flight cache check for the effective default of new indexes. A
+    // missing model previously surfaced only mid-warmup as N parallel index
+    // jobs all hitting the network at once; warn up front with the fix hint
+    // instead (the operator may be behind a proxy where HF is unreachable).
+    let effective_default = default_model.unwrap_or_default();
+    if !crate::embed::is_model_in_cache(effective_default) {
+        let line = format!(
+            "⚠️  Default embedding model '{}' is not in the models cache; the first \
+             index/query will download it from the network. Run `codesearch setup --model {}` \
+             to pre-download it.",
+            effective_default.short_name(),
+            effective_default.short_name(),
+        );
+        warn!("{}", line);
+        eprintln!("{}", line);
+    }
+
     // The idle-suspend window is resolved by the keep-warm task alone (flag >
     // env > default); nothing else consumes it, so `ServeState` does not carry
     // it. In particular the embedded TUI must NOT derive a poll cadence from it

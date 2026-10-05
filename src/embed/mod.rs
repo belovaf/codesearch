@@ -7,8 +7,9 @@ pub use cache::{
     CacheStats, CachedBatchEmbedder, PersistentCacheStats, PersistentEmbeddingCache, QueryCache,
     QueryCacheStats,
 };
-pub use embedder::{FastEmbedder, ModelType};
-
+pub use embedder::{
+    is_model_in_cache, load_default_model, save_default_model, FastEmbedder, ModelType,
+};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::env;
