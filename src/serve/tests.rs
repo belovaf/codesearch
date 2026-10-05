@@ -4178,3 +4178,213 @@ async fn sweeper_reasserts_cancellation_for_a_removed_live_task() {
         }
     }
 }
+
+// === Group fan-out chunk-id collision (misattribution) =================
+//
+// Chunk ids are per-repo counters, so every repo in a group holds chunk id 0.
+// The group tools used to resolve a bare id by probing every store and taking
+// the first answer — the alphabetically-first repo won the hit, the true
+// definition was filtered out as "wrong kind", and unrelated content rode the
+// stolen score. These fixtures seed BOTH repos' only chunk at id 0 so any
+// resolution that ignores the origin repo fails deterministically.
+
+/// Seed `<root>/.codesearch.db` with one chunk (id 0) whose content mentions
+/// the search term, then release the writer handle so ServeState can open it.
+async fn seed_collision_repo(
+    root: &std::path::Path,
+    rel_path: &str,
+    kind: crate::chunker::ChunkKind,
+    signature: Option<&str>,
+    content: &str,
+) {
+    let db_path = root.join(DB_DIR_NAME);
+    std::fs::create_dir_all(&db_path).unwrap();
+    std::fs::write(
+        db_path.join("metadata.json"),
+        r#"{"schema_version":1,"dimensions":2,"model_short_name":"minilm-l6-q"}"#,
+    )
+    .unwrap();
+    let stores = crate::index::SharedStores::new(&db_path, 2).expect("shared stores");
+    {
+        let mut vs = stores.vector_store.write().await;
+        let mut chunk = crate::chunker::Chunk::new(
+            content.to_string(),
+            0,
+            4,
+            kind,
+            rel_path.to_string(),
+        );
+        chunk.signature = signature.map(str::to_string);
+        vs.insert_chunks(vec![crate::embed::EmbeddedChunk::new(
+            chunk,
+            vec![0.25, 0.75],
+        )])
+        .expect("insert chunk");
+        vs.build_index().expect("build index");
+    }
+    {
+        let mut fts = stores.fts_store.write().await;
+        fts.add_chunk(0, content, rel_path, signature, &format!("{:?}", kind))
+            .expect("fts doc");
+        fts.commit().expect("fts commit");
+    }
+    drop(stores);
+}
+
+/// Two-repo uvz-shaped fixture where both repos hold exactly one chunk at the
+/// SAME id 0: `accounting-operations` (alphabetically first — the thief before
+/// the fix) has a prose comment mentioning the symbol, `bankruptcy` holds the
+/// real Java interface definition.
+async fn colliding_group_fixture() -> (tempfile::TempDir, crate::mcp::CodesearchService) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root_a = tmp.path().join("accounting-operations");
+    let root_b = tmp.path().join("bankruptcy");
+    std::fs::create_dir_all(&root_a).unwrap();
+    std::fs::create_dir_all(&root_b).unwrap();
+
+    seed_collision_repo(
+        &root_a,
+        "src/hooks/useBankruptcyFolder.ts",
+        crate::chunker::ChunkKind::Comment,
+        None,
+        "// TODO migrate this hook to BankruptcyFolderService from the bankruptcy service",
+    )
+    .await;
+    seed_collision_repo(
+        &root_b,
+        "src/main/java/ru/sberbank/bankruptcy/BankruptcyFolderService.java",
+        crate::chunker::ChunkKind::Interface,
+        Some("public interface BankruptcyFolderService"),
+        "public interface BankruptcyFolderService { BankruptcyFolder folderFor(String inn); }",
+    )
+    .await;
+
+    let mut config = ReposConfig::default();
+    config
+        .register_with_alias(root_a.clone(), Some("accounting-operations".to_string()))
+        .unwrap();
+    config
+        .register_with_alias(root_b.clone(), Some("bankruptcy".to_string()))
+        .unwrap();
+    config.groups.insert(
+        "uvz".to_string(),
+        vec![
+            "accounting-operations".to_string(),
+            "bankruptcy".to_string(),
+        ],
+    );
+    let config_file = tmp.path().join("repos.json");
+    config.save_to(&config_file).unwrap();
+    let state = std::sync::Arc::new(ServeState::new(config, Some(config_file)));
+    let service = crate::mcp::CodesearchService::new_for_serve(state).unwrap();
+    (tmp, service)
+}
+
+fn tool_text(res: &rmcp::model::CallToolResult) -> String {
+    match res.content.first() {
+        Some(rmcp::model::ContentBlock::Text(t)) => t.text.clone(),
+        other => panic!("expected text content, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn group_find_definition_attributes_hit_to_origin_repo_on_id_collision() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    let (_tmp, service) = colliding_group_fixture().await;
+
+    let request = crate::mcp::types::FindRequest {
+        kind: Some("definition".to_string()),
+        symbol: "BankruptcyFolderService".to_string(),
+        definition_kind: None,
+        limit: Some(10),
+        project: None,
+        group: Some("uvz".to_string()),
+    };
+    let res = service
+        .find(Parameters(request))
+        .await
+        .expect("group find must succeed");
+    let text = tool_text(&res);
+
+    // Before the fix this was the empty-result arm ("No definition found"):
+    // both hits resolved in accounting-operations' comment chunk, failed the
+    // DEFINITION_KINDS filter, and the true interface never surfaced.
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|_| panic!("non-JSON answer: {text}"));
+    let items = parsed
+        .as_array()
+        .unwrap_or_else(|| panic!("expected a bare result array, got: {text}"));
+    assert_eq!(items.len(), 1, "exactly the interface definition, got: {text}");
+    assert_eq!(
+        items[0]["path"],
+        "bankruptcy/src/main/java/ru/sberbank/bankruptcy/BankruptcyFolderService.java",
+        "the hit must carry its origin repo's alias prefix: {text}"
+    );
+    assert_eq!(items[0]["kind"], "Interface", "got: {text}");
+}
+
+#[tokio::test]
+async fn group_literal_search_attributes_each_hit_to_its_origin_repo() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    let (_tmp, service) = colliding_group_fixture().await;
+
+    let request = crate::mcp::types::LiteralSearchRequest {
+        query: "BankruptcyFolderService".to_string(),
+        regex: None,
+        phrase: None,
+        limit: Some(10),
+        file_glob: None,
+        language: None,
+        format: None,
+        project: None,
+        group: Some("uvz".to_string()),
+    };
+    let res = service
+        .literal_search(Parameters(request))
+        .await
+        .expect("group literal search must succeed");
+    let text = tool_text(&res);
+
+    // Before the fix BOTH hits resolved against accounting-operations' chunk
+    // (first store answering id 0): two identical hook paths, the Java file's
+    // content lost. After the fix each hit resolves in its own repo and every
+    // path carries its origin alias.
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|_| panic!("non-JSON answer: {text}"));
+    let items = parsed["results"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected a results array, got: {text}"))
+        .clone();
+    assert_eq!(items.len(), 2, "both repos must answer, got: {text}");
+
+    let mut paths: Vec<String> = items
+        .iter()
+        .map(|i| i["path"].as_str().unwrap_or_default().to_string())
+        .collect();
+    paths.sort();
+    assert_eq!(
+        paths,
+        vec![
+            "accounting-operations/src/hooks/useBankruptcyFolder.ts".to_string(),
+            "bankruptcy/src/main/java/ru/sberbank/bankruptcy/BankruptcyFolderService.java"
+                .to_string(),
+        ],
+        "each hit must keep its own repo's path and alias prefix: {text}"
+    );
+
+    // Snippet attribution: the prefixed java hit must be the interface content,
+    // not the accounting comment that stole it before the fix.
+    let java = items
+        .iter()
+        .find(|i| i["path"].as_str().unwrap_or("").starts_with("bankruptcy/"))
+        .expect("java hit present");
+    assert!(
+        java["snippet"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("public interface BankruptcyFolderService"),
+        "the bankruptcy hit must carry bankruptcy's own content: {text}"
+    );
+}

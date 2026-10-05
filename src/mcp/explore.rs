@@ -80,7 +80,11 @@ impl CodesearchService {
         if let Some(ref sv) = ctx.stores_vec {
             let aliases = ctx.aliases();
             let mut all_items: Vec<FileOutlineItem> = Vec::new();
-            let mut seen_ids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            // Dedup keys on (store, id): chunk ids are per-repo counters and
+            // collide across the fan-out, so a bare-id set would drop a later
+            // repo's outline entries.
+            let mut seen_ids: std::collections::HashSet<(usize, u32)> =
+                std::collections::HashSet::new();
             for (store_idx, store_arc) in sv.iter().enumerate() {
                 let store = match bounded_vector_read(&store_arc.vector_store).await {
                     Ok(store) => store,
@@ -92,7 +96,7 @@ impl CodesearchService {
                 match store.chunks_for_file(normalized) {
                     Ok(metas) => {
                         for c in metas {
-                            if seen_ids.insert(c.id) {
+                            if seen_ids.insert((store_idx, c.id)) {
                                 all_items.push(FileOutlineItem {
                                     chunk_id: c.id,
                                     kind: c.kind,

@@ -499,14 +499,6 @@ impl CodesearchService {
         let mode = request.mode.as_deref().unwrap_or("auto");
         let structural_intent = detect_structural_intent(&request.query);
 
-        // Which repo (alias) owns each surviving chunk id, recorded at
-        // fan-out and chunk-resolution time. The flat fan-out merge drops the
-        // store of origin, so without this map a group=all response cannot
-        // attribute a hit to its repo — `project=` results are prefixed
-        // "alias/path", group results must be too.
-        let mut alias_by_chunk: std::collections::HashMap<u32, String> =
-            std::collections::HashMap::new();
-
         // === Lexical mode: FTS only across all stores ===
         if mode == "lexical" {
             // Lexical has no second backend, so a failed store here is invisible
@@ -544,26 +536,21 @@ impl CodesearchService {
                     .await
                     .unwrap_or_default();
                 lexical_warnings.extend(exact_outcome.warnings("exact-identifier search"));
-                merge_exact_into_fts(&mut all_fts, exact_outcome.results);
+                merge_exact_into_fts_multi(&mut all_fts, exact_outcome.results);
             }
 
             all_fts.sort_by(|a, b| {
-                b.score
-                    .partial_cmp(&a.score)
+                b.result
+                    .score
+                    .partial_cmp(&a.result.score)
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
 
             let mut results = self
                 .resolve_fts_to_search_results_multi(
-                    &all_fts,
-                    limit,
-                    &stores,
-                    aliases,
-                    &mut lexical_warnings,
-                    &mut alias_by_chunk,
+                    &all_fts, limit, &stores, aliases, alias_roots, &mut lexical_warnings,
                 )
                 .await;
-            prefix_paths_with_alias(&mut results, &alias_by_chunk, alias_roots);
 
             if let Some(target_kind) = structural_intent {
                 boost_kind(&mut results, target_kind);
@@ -642,7 +629,9 @@ impl CodesearchService {
         }
 
         // Search vector stores across all repos, each with its own model's
-        // query embedding.
+        // query embedding. Results stay origin-tagged (see SourcedResult) —
+        // the tag replaces the old alias_by_chunk side-map, which keyed on
+        // bare chunk ids and could not survive the cross-repo collisions.
         let outcome = self
             .with_vector_store_read_multi(
                 |alias, store| {
@@ -654,9 +643,6 @@ impl CodesearchService {
                     let found = store
                         .search(embedding, limit * 5)
                         .context("Error searching vector store")?;
-                    for r in &found {
-                        alias_by_chunk.insert(r.id, alias.to_string());
-                    }
                     Ok(found)
                 },
                 stores.clone(),
@@ -714,19 +700,24 @@ impl CodesearchService {
 
         // === Mode: "semantic" — vector only ===
         if mode == "semantic" {
-            let fused = vector_only(&vector_results);
-            let chunk_to_result: std::collections::HashMap<u32, &crate::vectordb::SearchResult> =
-                vector_results.iter().map(|r| (r.id, r)).collect();
-
+            // Vector-only fan-out: no second backend to fuse with, so the RRF
+            // pass would be an identity function. Iterate the origin-tagged
+            // hits directly, prefixing each path from its own tag — the old
+            // `vector_only` + id-keyed map folded different repos' chunks
+            // onto one entry whenever their local ids collided.
             let mut results: Vec<crate::vectordb::SearchResult> = Vec::new();
-            for f in fused.into_iter().take(limit) {
-                if let Some(result) = chunk_to_result.get(&f.chunk_id) {
-                    let mut r = (*result).clone();
-                    r.score = f.rrf_score;
-                    results.push(r);
-                }
+            for hit in vector_results.iter().take(limit) {
+                let mut r = hit.result.clone();
+                r.path = prefix_path_with_alias(
+                    &r.path,
+                    Some(&hit.alias),
+                    alias_roots
+                        .get(&hit.alias)
+                        .map(String::as_str)
+                        .unwrap_or(""),
+                );
+                results.push(r);
             }
-            prefix_paths_with_alias(&mut results, &alias_by_chunk, alias_roots);
             return self.build_semantic_response(
                 results,
                 request,
@@ -765,7 +756,7 @@ impl CodesearchService {
 
         // Exact identifier search across all stores
         let all_exact = if !identifiers.is_empty() {
-            let mut exact_results: Vec<crate::fts::FtsResult> = Vec::new();
+            let mut exact_results: Vec<SourcedResult<crate::fts::FtsResult>> = Vec::new();
             for ident in identifiers {
                 let exact_outcome = self
                     .with_fts_store_read_multi(
@@ -777,7 +768,11 @@ impl CodesearchService {
                     .unwrap_or_default();
                 search_warnings.extend(exact_outcome.warnings("exact-identifier search"));
                 for r in exact_outcome.results {
-                    if !exact_results.iter().any(|e| e.chunk_id == r.chunk_id) {
+                    let key = (r.alias.clone(), r.result.chunk_id);
+                    if !exact_results
+                        .iter()
+                        .any(|e| (e.alias.clone(), e.result.chunk_id) == key)
+                    {
                         exact_results.push(r);
                     }
                 }
@@ -787,40 +782,103 @@ impl CodesearchService {
             Vec::new()
         };
 
+        // The pure fusion functions key on a single bare u32 — but chunk ids
+        // are per-repo counters and collide across a group, which fused
+        // different repos' chunks into one entry. Intern every (repo, chunk)
+        // pair to a unique synthetic id for the fusion call; the fused ids
+        // map straight back to their owning repo below.
+        let mut interned: std::collections::HashMap<(String, u32), u32> =
+            std::collections::HashMap::new();
+        fn intern_chunk(
+            map: &mut std::collections::HashMap<(String, u32), u32>,
+            key: (String, u32),
+        ) -> u32 {
+            let next = map.len() as u32;
+            *map.entry(key).or_insert(next)
+        }
+
+        let vector_translated: Vec<crate::vectordb::SearchResult> = vector_results
+            .iter()
+            .map(|hit| {
+                let mut r = hit.result.clone();
+                r.id = intern_chunk(&mut interned, (hit.alias.clone(), r.id));
+                r
+            })
+            .collect();
+        let fts_translated: Vec<crate::fts::FtsResult> = fts_results
+            .iter()
+            .map(|hit| crate::fts::FtsResult {
+                chunk_id: intern_chunk(&mut interned, (hit.alias.clone(), hit.result.chunk_id)),
+                score: hit.result.score,
+            })
+            .collect();
+        let exact_translated: Vec<crate::fts::FtsResult> = all_exact
+            .iter()
+            .map(|hit| crate::fts::FtsResult {
+                chunk_id: intern_chunk(&mut interned, (hit.alias.clone(), hit.result.chunk_id)),
+                score: hit.result.score,
+            })
+            .collect();
+
         // RRF fusion
         let fused = if identifiers.is_empty() {
-            rrf_fusion(&vector_results, &fts_results, vector_k as f32)
+            rrf_fusion(&vector_translated, &fts_translated, vector_k as f32)
         } else {
             rrf_fusion_with_exact(
-                &vector_results,
-                &fts_results,
-                &all_exact,
+                &vector_translated,
+                &fts_translated,
+                &exact_translated,
                 vector_k as f32,
                 fts_k as f32,
                 EXACT_MATCH_RRF_K,
             )
         };
 
-        // Map FusedResult back to SearchResult via chunk lookup across all stores
-        let chunk_to_result: std::collections::HashMap<u32, &crate::vectordb::SearchResult> =
-            vector_results.iter().map(|r| (r.id, r)).collect();
+        // Reverse side of the interning table: synthetic id -> (repo, chunk id).
+        let origins: Vec<(String, u32)> = {
+            let mut v: Vec<(String, u32)> = vec![Default::default(); interned.len()];
+            for ((alias, chunk_id), synth) in &interned {
+                v[*synth as usize] = (alias.clone(), *chunk_id);
+            }
+            v
+        };
+
+        // Fused ids that came from the vector half resolve by direct lookup;
+        // FTS-only hits are resolved in their ORIGIN store — never "the
+        // first store that answers this id".
+        let by_synth: std::collections::HashMap<u32, &SourcedResult<crate::vectordb::SearchResult>> =
+            vector_results
+                .iter()
+                .map(|hit| (interned[&(hit.alias.clone(), hit.result.id)], hit))
+                .collect();
 
         let mut mapped: Vec<crate::vectordb::SearchResult> = Vec::new();
         for f in fused.into_iter().take(limit) {
-            if let Some(result) = chunk_to_result.get(&f.chunk_id) {
-                let mut r = (*result).clone();
+            let Some((alias, real_id)) = origins.get(f.chunk_id as usize).cloned() else {
+                continue;
+            };
+            let root = alias_roots
+                .get(&alias)
+                .map(String::as_str)
+                .unwrap_or("");
+            if let Some(hit) = by_synth.get(&f.chunk_id) {
+                let mut r = hit.result.clone();
+                r.id = real_id;
                 r.score = f.rrf_score;
+                r.path = prefix_path_with_alias(&r.path, Some(&alias), root);
                 mapped.push(r);
             } else {
-                // Chunk from FTS but not in vector results — resolve from stores
+                // Chunk from FTS but not in vector results — resolve from its
+                // origin store only.
                 if let Some(resolved) = self
-                    .resolve_chunk_from_stores(
-                        f.chunk_id,
+                    .resolve_chunk_in_origin(
+                        &alias,
+                        real_id,
                         f.rrf_score,
                         &stores,
                         aliases,
+                        alias_roots,
                         &mut search_warnings,
-                        &mut alias_by_chunk,
                     )
                     .await
                 {
@@ -834,8 +892,6 @@ impl CodesearchService {
             boost_kind(&mut mapped, target_kind);
         }
 
-        prefix_paths_with_alias(&mut mapped, &alias_by_chunk, alias_roots);
-
         self.build_semantic_response(
             mapped,
             request,
@@ -847,18 +903,80 @@ impl CodesearchService {
         )
     }
 
-    /// Resolve a single chunk from multiple stores (used for FTS-only hits in multi-store fusion).
+    /// Resolve a fused FTS-only hit to full metadata, in its ORIGIN store.
+    ///
+    /// The old name ("from_stores") probed every store for the bare chunk id
+    /// and kept the first answer — on a group, ids are per-repo counters, so
+    /// that answered from the wrong repo and content/path attribution went to
+    /// whoever was probed first, not to the repo whose FTS actually matched.
     #[allow(clippy::too_many_arguments)]
-    async fn resolve_chunk_from_stores(
+    async fn resolve_chunk_in_origin(
         &self,
+        alias: &str,
         chunk_id: u32,
         score: f32,
         stores: &[Arc<SharedStores>],
         aliases: &[String],
+        alias_roots: &std::collections::HashMap<String, String>,
         warnings: &mut Vec<String>,
-        alias_by_chunk: &mut std::collections::HashMap<u32, String>,
     ) -> Option<crate::vectordb::SearchResult> {
-        for (idx, store_arc) in stores.iter().enumerate() {
+        let idx = aliases.iter().position(|a| a == alias)?;
+        let store_arc = &stores[idx];
+        let store = match bounded_vector_read(&store_arc.vector_store).await {
+            Ok(store) => store,
+            Err(e) => {
+                note_store_failure(warnings, aliases, idx, "chunk lookup", &e);
+                return None;
+            }
+        };
+        let root = alias_roots.get(alias).map(String::as_str).unwrap_or("");
+        match store.get_chunk(chunk_id) {
+            Ok(Some(chunk)) => Some(crate::vectordb::SearchResult {
+                id: chunk_id,
+                content: chunk.content,
+                path: prefix_path_with_alias(&chunk.path, Some(alias), root),
+                start_line: chunk.start_line,
+                end_line: chunk.end_line,
+                kind: chunk.kind,
+                signature: chunk.signature,
+                docstring: chunk.docstring,
+                context: chunk.context,
+                hash: chunk.hash,
+                distance: 0.0,
+                score,
+                context_prev: chunk.context_prev,
+                context_next: chunk.context_next,
+            }),
+            Ok(None) => None,
+            Err(ref e) => {
+                note_store_failure(warnings, aliases, idx, "chunk lookup", e);
+                None
+            }
+        }
+    }
+
+    /// Resolve origin-tagged FTS results to SearchResult, each in its own
+    /// repo's store, with the alias prefix applied from the tag.
+    async fn resolve_fts_to_search_results_multi(
+        &self,
+        fts_results: &[SourcedResult<crate::fts::FtsResult>],
+        limit: usize,
+        stores: &[Arc<SharedStores>],
+        aliases: &[String],
+        alias_roots: &std::collections::HashMap<String, String>,
+        warnings: &mut Vec<String>,
+    ) -> Vec<crate::vectordb::SearchResult> {
+        let mut results = Vec::new();
+        for fts in fts_results.iter().take(limit) {
+            // `Ok(None)` means "the ORIGIN store no longer holds this chunk"
+            // and is skipped; `Err` means the store is broken — collapsing
+            // the two is how a dead vector store renders as an empty literal
+            // search (the step-8 incident shape), so `Err` stays loud.
+            let idx = match aliases.iter().position(|a| *a == fts.alias) {
+                Some(idx) => idx,
+                None => continue,
+            };
+            let store_arc = &stores[idx];
             let store = match bounded_vector_read(&store_arc.vector_store).await {
                 Ok(store) => store,
                 Err(e) => {
@@ -866,21 +984,19 @@ impl CodesearchService {
                     continue;
                 }
             };
-            let looked_up = store.get_chunk(chunk_id);
+            let looked_up = store.get_chunk(fts.result.chunk_id);
             if let Err(ref e) = looked_up {
                 note_store_failure(warnings, aliases, idx, "chunk lookup", e);
             }
             if let Ok(Some(chunk)) = looked_up {
-                // Record the owning alias with the content actually chosen:
-                // path attribution below must match this very chunk, and the
-                // probe order here is what decided it.
-                if let Some(alias) = aliases.get(idx) {
-                    alias_by_chunk.insert(chunk_id, alias.clone());
-                }
-                return Some(crate::vectordb::SearchResult {
-                    id: chunk_id,
+                let root = alias_roots
+                    .get(&fts.alias)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                results.push(crate::vectordb::SearchResult {
+                    id: fts.result.chunk_id,
                     content: chunk.content,
-                    path: chunk.path,
+                    path: prefix_path_with_alias(&chunk.path, Some(&fts.alias), root),
                     start_line: chunk.start_line,
                     end_line: chunk.end_line,
                     kind: chunk.kind,
@@ -889,69 +1005,10 @@ impl CodesearchService {
                     context: chunk.context,
                     hash: chunk.hash,
                     distance: 0.0,
-                    score,
+                    score: fts.result.score,
                     context_prev: chunk.context_prev,
                     context_next: chunk.context_next,
                 });
-            }
-        }
-        None
-    }
-
-    /// Resolve FTS results to SearchResult using multiple stores.
-    #[allow(clippy::too_many_arguments)]
-    async fn resolve_fts_to_search_results_multi(
-        &self,
-        fts_results: &[crate::fts::FtsResult],
-        limit: usize,
-        stores: &[Arc<SharedStores>],
-        aliases: &[String],
-        warnings: &mut Vec<String>,
-        alias_by_chunk: &mut std::collections::HashMap<u32, String>,
-    ) -> Vec<crate::vectordb::SearchResult> {
-        let mut results = Vec::new();
-        for fts in fts_results.iter().take(limit) {
-            for (idx, store_arc) in stores.iter().enumerate() {
-                let store = match bounded_vector_read(&store_arc.vector_store).await {
-                    Ok(store) => store,
-                    Err(e) => {
-                        note_store_failure(warnings, aliases, idx, "chunk lookup", &e);
-                        continue;
-                    }
-                };
-                let looked_up = store.get_chunk(fts.chunk_id);
-                if let Err(ref e) = looked_up {
-                    // `Ok(None)` means "this store does not hold that chunk" and
-                    // is normal during fan-out; `Err` means the store is broken.
-                    // Collapsing the two is how a dead vector store renders as
-                    // an empty literal search — the exact shape of the step-8
-                    // incident, which tantivy-side checks cannot detect.
-                    note_store_failure(warnings, aliases, idx, "chunk lookup", e);
-                }
-                if let Ok(Some(chunk)) = looked_up {
-                    // Same as resolve_chunk_from_stores: attribute the alias of
-                    // the store this content was actually read from.
-                    if let Some(alias) = aliases.get(idx) {
-                        alias_by_chunk.insert(fts.chunk_id, alias.clone());
-                    }
-                    results.push(crate::vectordb::SearchResult {
-                        id: fts.chunk_id,
-                        content: chunk.content,
-                        path: chunk.path,
-                        start_line: chunk.start_line,
-                        end_line: chunk.end_line,
-                        kind: chunk.kind,
-                        signature: chunk.signature,
-                        docstring: chunk.docstring,
-                        context: chunk.context,
-                        hash: chunk.hash,
-                        distance: 0.0,
-                        score: fts.score,
-                        context_prev: chunk.context_prev,
-                        context_next: chunk.context_next,
-                    });
-                    break; // Found in this store, skip remaining stores
-                }
             }
         }
         results
@@ -1206,27 +1263,6 @@ impl CodesearchService {
                 }
                 Vec::new()
             }
-        }
-    }
-}
-
-/// Prefix group-fan-out result paths with the repo alias each chunk was
-/// recorded from, mirroring the `project=` routing ("alias/repo-relative").
-///
-/// Results whose alias was not recorded (every survivor is recorded at
-/// fan-out or resolution time, so this indicates an internal slip) keep their
-/// raw path — `build_semantic_response` still normalizes it.
-fn prefix_paths_with_alias(
-    results: &mut [crate::vectordb::SearchResult],
-    alias_by_chunk: &std::collections::HashMap<u32, String>,
-    alias_roots: &std::collections::HashMap<String, String>,
-) {
-    for r in results.iter_mut() {
-        let Some(alias) = alias_by_chunk.get(&r.id) else {
-            continue;
-        };
-        if let Some(root) = alias_roots.get(alias) {
-            r.path = prefix_path_with_alias(&r.path, Some(alias), root);
         }
     }
 }

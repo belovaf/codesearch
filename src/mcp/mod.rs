@@ -280,6 +280,32 @@ fn merge_exact_into_fts(
     }
 }
 
+/// Group-fan-out sibling of [`merge_exact_into_fts`]: merge exact-identifier
+/// hits into the lexical result set, deduplicating by `(alias, chunk_id)` —
+/// a bare chunk_id is store-local and collides across repos, so keying on it
+/// alone would fold one repo's chunk into another's entry.
+fn merge_exact_into_fts_multi(
+    fts_results: &mut Vec<SourcedResult<crate::fts::FtsResult>>,
+    exact: Vec<SourcedResult<crate::fts::FtsResult>>,
+) {
+    let mut positions: std::collections::HashMap<(String, u32), usize> = fts_results
+        .iter()
+        .enumerate()
+        .map(|(idx, r)| ((r.alias.clone(), r.result.chunk_id), idx))
+        .collect();
+
+    for r in exact {
+        let key = (r.alias.clone(), r.result.chunk_id);
+        if let Some(&existing_idx) = positions.get(&key) {
+            let existing = &mut fts_results[existing_idx];
+            existing.result.score = existing.result.score.max(r.result.score);
+        } else {
+            positions.insert(key, fts_results.len());
+            fts_results.push(r);
+        }
+    }
+}
+
 /// Compute low-confidence signaling based on the top result's score.
 ///
 /// Returns `(low_confidence, suggested_tool)` where both are `None` when
@@ -1391,7 +1417,7 @@ impl CodesearchService {
         R: Clone + HasChunkId + HasScore,
     {
         let mut failures: Vec<(String, String)> = Vec::new();
-        let mut all_results: Vec<R> = Vec::new();
+        let mut all_results: Vec<SourcedResult<R>> = Vec::new();
         let mut seen_ids: std::collections::HashMap<(String, u32), usize> =
             std::collections::HashMap::new();
 
@@ -1410,12 +1436,15 @@ impl CodesearchService {
                         let key = (alias.to_string(), r.chunk_id());
                         if let Some(&existing_idx) = seen_ids.get(&key) {
                             // Keep the one with higher score
-                            if r.score() > all_results[existing_idx].score() {
-                                all_results[existing_idx] = r;
+                            if r.score() > all_results[existing_idx].result.score() {
+                                all_results[existing_idx].result = r;
                             }
                         } else {
                             seen_ids.insert(key, all_results.len());
-                            all_results.push(r);
+                            // The tag is load-bearing: chunk ids repeat across
+                            // repos, so a bare id cannot address the chunk that
+                            // produced this hit at resolution time.
+                            all_results.push(SourcedResult::new(alias.to_string(), r));
                         }
                     }
                 }
@@ -1436,8 +1465,9 @@ impl CodesearchService {
 
         // Sort by score descending
         all_results.sort_by(|a, b| {
-            b.score()
-                .partial_cmp(&a.score())
+            b.result
+                .score()
+                .partial_cmp(&a.result.score())
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
@@ -1467,7 +1497,7 @@ impl CodesearchService {
         R: Clone + HasChunkId + HasScore,
     {
         let mut failures: Vec<(String, String)> = Vec::new();
-        let mut all_results: Vec<R> = Vec::new();
+        let mut all_results: Vec<SourcedResult<R>> = Vec::new();
         let mut seen_ids: std::collections::HashMap<(String, u32), usize> =
             std::collections::HashMap::new();
 
@@ -1485,12 +1515,14 @@ impl CodesearchService {
                     for r in results {
                         let key = (alias.to_string(), r.chunk_id());
                         if let Some(&existing_idx) = seen_ids.get(&key) {
-                            if r.score() > all_results[existing_idx].score() {
-                                all_results[existing_idx] = r;
+                            if r.score() > all_results[existing_idx].result.score() {
+                                all_results[existing_idx].result = r;
                             }
                         } else {
                             seen_ids.insert(key, all_results.len());
-                            all_results.push(r);
+                            // Same contract as the vector fan-out: the tag, not
+                            // the bare id, is what identifies the chunk later.
+                            all_results.push(SourcedResult::new(alias.to_string(), r));
                         }
                     }
                 }
@@ -1509,8 +1541,9 @@ impl CodesearchService {
 
         // Sort by score descending
         all_results.sort_by(|a, b| {
-            b.score()
-                .partial_cmp(&a.score())
+            b.result
+                .score()
+                .partial_cmp(&a.result.score())
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 

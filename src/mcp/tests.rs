@@ -2395,13 +2395,27 @@ fn record_stats_or_warn_does_not_duplicate_the_same_warning() {
 #[test]
 fn into_results_routes_failures_into_warnings() {
     let outcome = super::MultiReadOutcome {
-        results: vec![1u32, 2],
+        results: vec![
+            super::SourcedResult::new("inriver", 1u32),
+            super::SourcedResult::new("example-repo", 2),
+        ],
         failures: vec![("inriver".to_string(), "os error 22".to_string())],
     };
     let mut warnings = Vec::new();
     let results = outcome.into_results(&mut warnings, "chunk lookup");
 
-    assert_eq!(results, vec![1, 2]);
+    // Unwrap the origin tags the way every consumer now reads them.
+    let unwrapped: Vec<(String, u32)> = results
+        .into_iter()
+        .map(|tagged| (tagged.alias, tagged.result))
+        .collect();
+    assert_eq!(
+        unwrapped,
+        vec![
+            ("inriver".to_string(), 1),
+            ("example-repo".to_string(), 2)
+        ]
+    );
     assert_eq!(
         warnings,
         vec!["repo 'inriver' chunk lookup failed: os error 22".to_string()],

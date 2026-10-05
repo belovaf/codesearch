@@ -169,8 +169,22 @@ impl CodesearchService {
                                 None
                             }
                         };
+                        // The owning alias is known here — prefix with it
+                        // directly. `prefix_result_path` infers the alias by
+                        // path-root matching, which never matches a
+                        // project-relative stored path, so the group-scoped
+                        // answer used to ship unprefixed.
+                        let root = ctx
+                            .alias_roots
+                            .get(alias)
+                            .map(String::as_str)
+                            .unwrap_or("");
                         match store.as_ref().map(|s| s.get_chunk(request.chunk_id)) {
-                            Some(Ok(c)) => c,
+                            Some(Ok(Some(mut c))) => {
+                                c.path = prefix_path_with_alias(&c.path, Some(alias), root);
+                                Some(c)
+                            }
+                            Some(Ok(None)) => None,
                             Some(Err(ref e)) => {
                                 push_store_warning(
                                     &mut chunk_warnings,
