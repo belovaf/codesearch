@@ -3043,3 +3043,208 @@ fn single_index_status_requires_a_built_graph_to_report_ready() {
     let (status, _) = super::single_index_status(0, false);
     assert_eq!(status, "building");
 }
+
+// === group fan-out degradation under write locks ===
+//
+// A multi-repo fan-out is an interactive query: it must never queue behind a
+// repo held by a running indexing batch. Before the fix the fan-out used the
+// bounded 300s read wait per store, so N busy repos summed to N waits and
+// stalled every other repo's answer — the MCP wedge.
+
+#[tokio::test]
+async fn vector_fan_out_skips_write_locked_store_instead_of_waiting() {
+    // alpha's vector write lock is held for the whole call, as an indexing
+    // batch would hold it; beta is free. The fan-out must skip alpha (one
+    // failure naming it) instead of blocking on it.
+    let root_a = tempfile::tempdir().expect("tempdir a");
+    let stores_a = std::sync::Arc::new(
+        crate::index::SharedStores::new(&root_a.path().join(".codesearch.db"), 2)
+            .expect("stores a"),
+    );
+    let root_b = tempfile::tempdir().expect("tempdir b");
+    let stores_b = std::sync::Arc::new(
+        crate::index::SharedStores::new(&root_b.path().join(".codesearch.db"), 2)
+            .expect("stores b"),
+    );
+    let service = super::CodesearchService::new_with_stores(
+        Some(root_b.path().to_path_buf()),
+        Some(stores_b.clone()),
+    )
+    .expect("service");
+
+    let _alpha_write = stores_a.vector_store.write().await;
+
+    let outcome = service
+        .with_vector_store_read_multi(
+            |_alias, _store| {
+                Ok::<_, anyhow::Error>(Vec::<crate::vectordb::SearchResult>::new())
+            },
+            vec![stores_a.clone(), stores_b.clone()],
+            &["alpha".to_string(), "beta".to_string()],
+        )
+        .await
+        .expect("fan-out itself must not error");
+
+    assert!(
+        outcome.results.is_empty(),
+        "the locked store must be skipped, not answered from"
+    );
+    assert_eq!(
+        outcome.failures.len(),
+        1,
+        "only alpha must fail, failures: {:?}",
+        outcome.failures
+    );
+    assert_eq!(outcome.failures[0].0, "alpha");
+    assert!(
+        outcome.failures[0].1.contains("store busy"),
+        "failure must explain itself: {}",
+        outcome.failures[0].1
+    );
+}
+
+#[tokio::test]
+async fn lexical_group_search_degrades_per_repo_when_a_store_is_write_locked() {
+    use rmcp::model::ContentBlock;
+
+    // Same contract through the full lexical flow: alpha mid-indexing, beta
+    // searchable. The group answers from beta alone, with a warning naming
+    // alpha — the skipped repo must degrade visibly, never silently.
+    let root_a = tempfile::tempdir().expect("tempdir a");
+    let stores_a = std::sync::Arc::new(
+        crate::index::SharedStores::new(&root_a.path().join(".codesearch.db"), 2)
+            .expect("stores a"),
+    );
+    {
+        let mut vs = stores_a.vector_store.write().await;
+        let chunk = crate::chunker::Chunk::new(
+            "fn gadget() {}".to_string(),
+            0,
+            0,
+            crate::chunker::ChunkKind::Function,
+            "src/lib.rs".to_string(),
+        );
+        vs.insert_chunks(vec![crate::embed::EmbeddedChunk::new(
+            chunk,
+            vec![0.0, 1.0],
+        )])
+        .expect("insert chunk a");
+        vs.build_index().expect("build index a");
+    }
+    {
+        let mut fts = stores_a.fts_store.write().await;
+        fts.add_chunk(0, "fn gadget() {}", "src/lib.rs", None, "Function")
+            .expect("fts doc a");
+        fts.commit().expect("commit a");
+    }
+    let root_b = tempfile::tempdir().expect("tempdir b");
+    let stores_b = std::sync::Arc::new(
+        crate::index::SharedStores::new(&root_b.path().join(".codesearch.db"), 2)
+            .expect("stores b"),
+    );
+    {
+        // insert_chunks assigns ids from 0 per store, so a filler chunk keeps
+        // the real one at id 1 and the two test repos never share a chunk id.
+        let mut vs = stores_b.vector_store.write().await;
+        let filler = crate::chunker::Chunk::new(
+            "filler".to_string(),
+            0,
+            0,
+            crate::chunker::ChunkKind::Function,
+            "src/filler.rs".to_string(),
+        );
+        let chunk = crate::chunker::Chunk::new(
+            "gadget helper".to_string(),
+            0,
+            0,
+            crate::chunker::ChunkKind::Function,
+            "src/util.rs".to_string(),
+        );
+        vs.insert_chunks(vec![crate::embed::EmbeddedChunk::new(
+            filler,
+            vec![0.5, 0.5],
+        )])
+        .expect("insert filler b");
+        vs.insert_chunks(vec![crate::embed::EmbeddedChunk::new(
+            chunk,
+            vec![1.0, 0.0],
+        )])
+        .expect("insert chunk b");
+        vs.build_index().expect("build index b");
+    }
+    {
+        let mut fts = stores_b.fts_store.write().await;
+        fts.add_chunk(1, "gadget helper", "src/util.rs", None, "Function")
+            .expect("fts doc b");
+        fts.commit().expect("commit b");
+    }
+
+    let service = super::CodesearchService::new_with_stores(
+        Some(root_b.path().to_path_buf()),
+        Some(stores_b.clone()),
+    )
+    .expect("service");
+
+    let request = super::SemanticSearchRequest {
+        query: "gadget".to_string(),
+        limit: Some(10),
+        compact: Some(false),
+        filter_path: None,
+        mode: Some("lexical".to_string()),
+        project: None,
+        group: Some("all".to_string()),
+        min_score: None,
+    };
+    let mut alias_roots = std::collections::HashMap::new();
+    alias_roots.insert(
+        "alpha".to_string(),
+        crate::cache::normalize_path_str(&root_a.path().to_string_lossy()),
+    );
+    alias_roots.insert(
+        "beta".to_string(),
+        crate::cache::normalize_path_str(&root_b.path().to_string_lossy()),
+    );
+
+    // Hold alpha's FTS write lock across the call, as a live indexing run
+    // would. The query must still return promptly from beta.
+    let _alpha_fts_write = stores_a.fts_store.write().await;
+
+    let result = service
+        .semantic_search_multi(
+            &request,
+            &[],
+            10,
+            false,
+            vec![stores_a.clone(), stores_b.clone()],
+            &["alpha".to_string(), "beta".to_string()],
+            &alias_roots,
+        )
+        .await
+        .expect("group search must succeed despite one busy store");
+
+    let json = match &result.content[0] {
+        ContentBlock::Text(t) => t.text.clone(),
+        other => panic!("expected text content, got {other:?}"),
+    };
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json response");
+    let paths: Vec<&str> = parsed["results"]
+        .as_array()
+        .expect("results array")
+        .iter()
+        .map(|r| r["path"].as_str().expect("path string"))
+        .collect();
+    assert_eq!(paths, vec!["beta/src/util.rs"], "paths: {paths:?}");
+    let warnings_text = parsed["warnings"]
+        .as_array()
+        .map(|ws| {
+            ws.iter()
+                .map(|w| w.as_str().unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    assert!(
+        warnings_text.contains("alpha") && warnings_text.contains("store busy"),
+        "warnings must name the skipped repo and why: {warnings_text}"
+    );
+}

@@ -181,8 +181,17 @@ impl CodesearchService {
         let model_resolution = self.resolve_query_model(ctx.project_alias.as_deref());
         let query_embedding = {
             let model = model_resolution.model;
-            let service = match self.embedding_service_for(model) {
-                Ok(s) => s,
+            let service = match self.embedding_service_for_query(model).await {
+                Ok(Some(s)) => s,
+                Ok(None) => {
+                    return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                        "Embedding model '{}' is not available locally, and search never \
+                         downloads models. Populate the model cache (codesearch setup) or \
+                         re-index this repo, then retry. Literal search (mode=\"literal\") \
+                         works without embedding models.",
+                        model.short_name()
+                    ))]));
+                }
                 Err(e) => {
                     tracing::error!("MCP: Failed to get embedding service: {:?}", e);
                     return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
@@ -191,17 +200,33 @@ impl CodesearchService {
                 }
             };
 
-            let mut service = service.lock().unwrap();
             tracing::debug!(
                 "MCP: Embedding query with model '{}'...",
                 model.short_name()
             );
-            match service.embed_query(&request.query) {
-                Ok(e) => e,
-                Err(e) => {
+            // ONNX inference is CPU-bound; running it inline pins an async
+            // worker for the whole pass. Poison is recovered rather than
+            // propagated — same contract as embed_chunks_yielding.
+            let query_text = request.query.clone();
+            match tokio::task::spawn_blocking(move || {
+                let mut guard = service
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                guard.embed_query(&query_text)
+            })
+            .await
+            {
+                Ok(Ok(e)) => e,
+                Ok(Err(e)) => {
                     tracing::error!("MCP: Failed to embed query: {:?}", e);
                     return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                         "Error embedding query: {e:#}"
+                    ))]));
+                }
+                Err(e) => {
+                    tracing::error!("MCP: Embedding task failed: {:?}", e);
+                    return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                        "Error embedding query: {e}"
                     ))]));
                 }
             }
@@ -590,9 +615,20 @@ impl CodesearchService {
         // here and folded into `search_warnings` below so an agent sees the
         // assumption alongside the results it applies to.
         let mut model_warnings: Vec<String> = Vec::new();
+        // Repos whose model is unavailable to search (not loaded and not on
+        // disk). Dropped from the VECTOR fan-out only — the FTS pass still
+        // covers them, since literal search needs no embeddings.
+        let mut no_model_aliases: Vec<String> = Vec::new();
         {
             let mut by_model: std::collections::HashMap<crate::embed::ModelType, Vec<f32>> =
                 std::collections::HashMap::new();
+            // One warning per distinct missing model, not per repo: a group
+            // often shares a single model, and N copies of the same warning is
+            // noise an agent has to read past.
+            let mut missing_by_model: std::collections::HashMap<
+                crate::embed::ModelType,
+                Vec<String>,
+            > = std::collections::HashMap::new();
             for alias in aliases {
                 let model_resolution = self.resolve_query_model(Some(alias));
                 let model = model_resolution.model;
@@ -601,31 +637,68 @@ impl CodesearchService {
                 }
                 let embedding = match by_model.get(&model) {
                     Some(cached) => cached.clone(),
-                    None => {
-                        let service = match self.embedding_service_for(model) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                return Ok(CallToolResult::success(vec![ContentBlock::text(
-                                    format!(
-                                        "Error initializing embedding service for '{alias}': {e:#}"
-                                    ),
-                                )]));
-                            }
-                        };
-                        let mut service = service.lock().unwrap();
-                        let embedding = match service.embed_query(&request.query) {
-                            Ok(e) => e,
-                            Err(e) => {
-                                return Ok(CallToolResult::success(vec![ContentBlock::text(
-                                    format!("Error embedding query: {e:#}"),
-                                )]));
-                            }
-                        };
-                        by_model.insert(model, embedding.clone());
-                        embedding
-                    }
+                    None => match self.embedding_service_for_query(model).await {
+                        Ok(Some(service)) => {
+                            // ONNX inference is CPU-bound; running it inline
+                            // pins an async worker for the whole pass. Poison
+                            // recovery — same contract as the single-project
+                            // path.
+                            let query_text = request.query.clone();
+                            let embedding = match tokio::task::spawn_blocking(move || {
+                                let mut guard = service
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                guard.embed_query(&query_text)
+                            })
+                            .await
+                            {
+                                Ok(Ok(e)) => e,
+                                Ok(Err(e)) => {
+                                    return Ok(CallToolResult::success(vec![
+                                        ContentBlock::text(format!(
+                                            "Error embedding query: {e:#}"
+                                        )),
+                                    ]));
+                                }
+                                Err(e) => {
+                                    return Ok(CallToolResult::success(vec![
+                                        ContentBlock::text(format!(
+                                            "Embedding task failed: {e}"
+                                        )),
+                                    ]));
+                                }
+                            };
+                            by_model.insert(model, embedding.clone());
+                            embedding
+                        }
+                        Ok(None) => {
+                            missing_by_model
+                                .entry(model)
+                                .or_default()
+                                .push(alias.clone());
+                            continue;
+                        }
+                        Err(e) => {
+                            return Ok(CallToolResult::success(vec![ContentBlock::text(
+                                format!(
+                                    "Error initializing embedding service for '{alias}': {e:#}"
+                                ),
+                            )]));
+                        }
+                    },
                 };
                 embeddings_by_alias.insert(alias.clone(), embedding);
+            }
+            for (model, missing) in missing_by_model {
+                model_warnings.push(format!(
+                    "semantic skipped for {} repo(s) using model '{}' not available \
+                     locally (search never downloads models; populate the cache via \
+                     codesearch setup or re-index): {}",
+                    missing.len(),
+                    model.short_name(),
+                    missing.join(", ")
+                ));
+                no_model_aliases.extend(missing);
             }
         }
 
@@ -633,6 +706,33 @@ impl CodesearchService {
         // query embedding. Results stay origin-tagged (see SourcedResult) —
         // the tag replaces the old alias_by_chunk side-map, which keyed on
         // bare chunk ids and could not survive the cross-repo collisions.
+        //
+        // Only repos that got a query embedding take part: a repo whose model
+        // is unavailable locally must not force a download — or, on a
+        // black-holed network, an indefinite wedge — for the whole group.
+        // The FTS pass below still covers skipped repos in hybrid/auto/
+        // lexical, so they degrade, not disappear.
+        let skip_set: std::collections::HashSet<&str> =
+            no_model_aliases.iter().map(String::as_str).collect();
+        let vector_stores: Vec<Arc<SharedStores>> = stores
+            .iter()
+            .zip(aliases.iter())
+            .filter(|(_, alias)| !skip_set.contains(alias.as_str()))
+            .map(|(store, _)| Arc::clone(store))
+            .collect();
+        let vector_aliases: Vec<String> = aliases
+            .iter()
+            .filter(|alias| !skip_set.contains(alias.as_str()))
+            .cloned()
+            .collect();
+        if mode == "semantic" && !no_model_aliases.is_empty() && vector_stores.is_empty() {
+            let detail = model_warnings.join("\n");
+            return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                "Semantic search could not run: every repo in this group was skipped \
+                 because its embedding model is missing locally.\n{detail}\nLiteral \
+                 search (mode=\"literal\") works without embedding models."
+            ))]));
+        }
         let outcome = self
             .with_vector_store_read_multi(
                 |alias, store| {
@@ -646,8 +746,8 @@ impl CodesearchService {
                         .context("Error searching vector store")?;
                     Ok(found)
                 },
-                stores.clone(),
-                aliases,
+                vector_stores,
+                &vector_aliases,
             )
             .await;
 
@@ -663,7 +763,7 @@ impl CodesearchService {
                         tracing::error!(
                             "MCP: vector fan-out degraded — {} of {} repo(s) failed: {:?}",
                             o.failures.len(),
-                            stores.len(),
+                            vector_aliases.len(),
                             o.failures
                         );
                         // Only "semantic" has no second backend to fall back on. In
@@ -681,7 +781,7 @@ impl CodesearchService {
                                 "Error searching vector store: {} of {} repo(s) in scope failed \
                              and none returned results:\n{}",
                                 o.failures.len(),
-                                stores.len(),
+                                vector_aliases.len(),
                                 detail
                             ))]));
                         }

@@ -1075,16 +1075,34 @@ impl CodesearchService {
         }
     }
 
-    /// Get (lazily initializing) the embedding service for `model`.
+    /// Resolve the embedding service for a SEARCH query — or `None` when the
+    /// model cannot be used without a network fetch.
     ///
-    /// The returned `Arc<Mutex<..>>` is per-model, so concurrent queries against
-    /// different models do not serialise on one global lock. Callers MUST pass
-    /// the model the target index was built with — see [`Self::query_model`].
-    pub(crate) fn embedding_service_for(
+    /// Search is interactive: a cold-cache model resolves through hf-hub, and
+    /// on networks that black-hole the model host that fetch never completes
+    /// and never errors — the whole-night serve stall. So search accepts only
+    /// a model that is already loaded or whose files are provably on disk
+    /// ([`crate::embed::is_model_in_cache`], a pure fs probe). Downloading
+    /// stays on the indexing path (`codesearch index`, `codesearch setup`),
+    /// where it belongs to a background task with progress, not to a query.
+    pub(crate) async fn embedding_service_for_query(
         &self,
         model: ModelType,
-    ) -> Result<Arc<Mutex<crate::embed::EmbeddingService>>> {
-        self.embedding_pool.get(model)
+    ) -> Result<Option<Arc<Mutex<crate::embed::EmbeddingService>>>> {
+        if let Some(service) = self.embedding_pool.get_if_cached(model) {
+            return Ok(Some(service));
+        }
+        if !crate::embed::is_model_in_cache(model) {
+            return Ok(None);
+        }
+        // Files are on disk, so this load cannot become a network fetch. It
+        // is still ONNX init work (hundreds of MB mapped) — keep it off the
+        // async worker; the pool bounds it by MODEL_LOAD_TIMEOUT_SECS.
+        let pool = self.embedding_pool.clone();
+        match tokio::task::spawn_blocking(move || pool.get(model)).await {
+            Ok(result) => result.map(Some),
+            Err(e) => Err(anyhow::anyhow!("embedding model load task failed: {e}")),
+        }
     }
 
     /// Return the current MCP mode as a string for diagnostics.
@@ -1425,10 +1443,22 @@ impl CodesearchService {
 
         for (idx, store_arc) in stores.iter().enumerate() {
             let alias = aliases.get(idx).map(|s| s.as_str()).unwrap_or("unknown");
-            let store = match bounded_vector_read(&store_arc.vector_store).await {
+            // Try-lock, never wait: a multi-repo fan-out is an interactive
+            // query, and waiting for one busy repo's write lock would stall
+            // every other repo's result behind it (waits sum up per busy
+            // store, up to the full bounded wait each). A store held by a
+            // running indexing batch is skipped and reported instead; the
+            // same request against that single repo alone still waits, via
+            // the bounded single-store helpers.
+            let store = match store_arc.vector_store.try_read() {
                 Ok(store) => store,
-                Err(e) => {
-                    failures.push((alias.to_string(), format!("{e:#}")));
+                Err(_) => {
+                    failures.push((
+                        alias.to_string(),
+                        "store busy: active indexing holds the write lock — \
+                         repo skipped in this fan-out, retry shortly"
+                            .to_string(),
+                    ));
                     continue;
                 }
             };
@@ -1505,10 +1535,18 @@ impl CodesearchService {
 
         for (idx, store_arc) in stores.iter().enumerate() {
             let alias = aliases.get(idx).map(|s| s.as_str()).unwrap_or("unknown");
-            let fts = match bounded_fts_read(&store_arc.fts_store).await {
+            // Try-lock, never wait — same rationale as the vector fan-out:
+            // a busy repo is skipped and reported, not allowed to stall the
+            // whole group's literal results.
+            let fts = match store_arc.fts_store.try_read() {
                 Ok(fts) => fts,
-                Err(e) => {
-                    failures.push((alias.to_string(), format!("{e:#}")));
+                Err(_) => {
+                    failures.push((
+                        alias.to_string(),
+                        "store busy: active indexing holds the write lock — \
+                         repo skipped in this fan-out, retry shortly"
+                            .to_string(),
+                    ));
                     continue;
                 }
             };
