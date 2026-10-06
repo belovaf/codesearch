@@ -1,5 +1,7 @@
+using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using Microsoft.Build.Locator;
+using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.MSBuild;
 
 namespace ScipCsharp;
@@ -323,8 +325,90 @@ public static class Program
 
         var workspace = MSBuildWorkspace.Create(properties);
         workspace.WorkspaceFailed += (_, e) =>
+        {
+            // Warning-severity diagnostics are benign resolution notes (e.g.
+            // "Found project reference without a matching metadata reference"
+            // for excluded or external projects): they do not block indexing
+            // and would pin the repo's index warning forever. Only true
+            // failures belong in the warning channel.
+            if (e.Diagnostic.Kind == WorkspaceDiagnosticKind.Warning)
+            {
+                Console.Error.WriteLine($"[INFO] Workspace note: {e.Diagnostic}");
+                return;
+            }
+            // NuGet's vulnerability audit surfaces as an Msbuild "failure" but
+            // is a security advisory, not a load failure — the index is
+            // unaffected and emitting it would pin the repo's index warning
+            // until the package is bumped.
+            if (WorkspaceNoise.IsNuGetAuditNoise(e.Diagnostic?.Message))
+            {
+                return;
+            }
             Console.Error.WriteLine($"[WARN] Workspace error: {e.Diagnostic}");
+        };
         return workspace;
+    }
+
+    /// <summary>
+    /// Restores the solution before the design-time load. MSBuildWorkspace
+    /// does not restore: with stale or missing obj/project.assets.json,
+    /// package-typed references fail to resolve and the load drowns in CS0246
+    /// cascades even though `dotnet build` (which restores first) succeeds.
+    /// Gated by <see cref="RestorePolicy.NeedsRestore"/>; best effort: a
+    /// failed or missing `dotnet` is logged and the load proceeds — degraded
+    /// indexing beats no indexing. The wait is bounded, but the restore is
+    /// never killed: on timeout it continues in the background and the next
+    /// reindex picks up the fresh assets.
+    /// </summary>
+    private static void RestoreSolution(string solutionPath)
+    {
+        var timeoutSeconds = RestorePolicy.RestoreTimeoutSeconds();
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = "dotnet",
+                // --ignore-failed-sources: an unreachable private feed must not
+                // block indexing when the packages are already in the cache.
+                Arguments = $"restore \"{solutionPath}\" --nologo -v q --ignore-failed-sources",
+                RedirectStandardError = true,
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+            };
+            using var process = Process.Start(psi);
+            if (process is null)
+            {
+                return;
+            }
+            // Drain both pipes in the background: the child inherits these
+            // handles, so without readers a chatty restore could block on a
+            // full pipe, and the serve process reads stderr until EOF.
+            _ = process.StandardOutput.ReadToEndAsync();
+            _ = process.StandardError.ReadToEndAsync();
+            // Bounded WAIT, never a kill: a killed restore wastes all of its
+            // work and leaves assets missing, so every reindex would pay the
+            // same wait and stay degraded. On timeout the restore keeps
+            // running in the background (the child outlives this process);
+            // this load proceeds degraded and the next reindex finds the
+            // fresh assets and loads clean. Timeout is env-tunable for large
+            // solutions on slow feeds.
+            if (!process.WaitForExit(timeoutSeconds * 1000))
+            {
+                Console.Error.WriteLine(RestorePolicy.StillRunningWarning(timeoutSeconds));
+                return;
+            }
+            if (process.ExitCode != 0)
+            {
+                Console.Error.WriteLine(
+                    $"[WARN] dotnet restore exited {process.ExitCode} for '{solutionPath}' — continuing; " +
+                    "package references may be unresolved (degraded symbols).");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(
+                $"[WARN] dotnet restore could not start ({ex.GetType().Name}: {ex.Message}) — continuing without it.");
+        }
     }
 
     // ── Solution filtering ───────────────────────────────────────────
@@ -352,6 +436,16 @@ public static class Program
         var unsupported = projectEntries
             .Where(p => UnsupportedProjectExtensions.Contains(Path.GetExtension(p.RelativePath)))
             .ToList();
+
+        // Restore only when the evidence says assets are missing or stale: the
+        // design-time build below does not restore, and missing package assets
+        // cascade into CS0246 noise that would otherwise pin the repo's index
+        // warning. But restoring on every reindex is far too heavy for
+        // multi-repo hubs — fresh assets mean no restore at all.
+        if (RestorePolicy.NeedsRestore(supported.Select(p => p.RelativePath), solutionDir))
+        {
+            RestoreSolution(solutionPath);
+        }
 
         // Log skipped projects
         foreach (var skip in unsupported)
