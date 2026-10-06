@@ -6590,12 +6590,16 @@ pub async fn run_serve(
             Ok(svc)
         };
 
-    // Build session manager without keep_alive timeout. The default rmcp timeout
-    // (5 min) kills idle sessions too aggressively for a local long-running serve.
-    // We run single-user local, so abandoned sessions cost nothing — let TCP
-    // liveness determine when a session is truly dead.
+    // Bound idle MCP session lifetime. The previous "no keep-alive" stance
+    // assumed TCP liveness would reap dead clients, but a wedged session
+    // (a request the client already gave up on) keeps its socket and its
+    // session worker alive indefinitely — observed as active_sessions=4 with
+    // a single client, each leaked session pinning an rmcp worker task.
+    // 30 minutes is far beyond any human pause in local interactive use,
+    // yet guarantees a stuck session — and its FIFO-serialized request
+    // queue — eventually goes away without a serve restart.
     let mut session_manager = LocalSessionManager::default();
-    session_manager.session_config.keep_alive = None;
+    session_manager.session_config.keep_alive = Some(std::time::Duration::from_secs(1800));
     let session_manager = Arc::new(session_manager);
 
     // Configure the rmcp Streamable HTTP server's DNS-rebinding defence
