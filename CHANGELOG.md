@@ -14,12 +14,16 @@ more PRs land; when the release is actually tagged, the same section is
 finalized in place with a date — no renaming/migration step needed.
 -->
 
-## [1.5.2]
+## [1.5.2] - 2026-10-05
 
 ### Fixed
 
 - **Restore runs only when package assets are missing or stale, and warning-severity workspace diagnostics no longer count as index warnings.** Restoring on every reindex was far too heavy for multi-repo hubs and big solutions legitimately exceed any fixed timeout (`dotnet restore did not finish within 300s` was observed live). Now the helper checks each project's `obj/project.assets.json` against its .csproj and restores only when evidence demands it (the steady state of an actively developed repo is a no-op), the kill timeout is tunable via `CODESEARCH_RESTORE_TIMEOUT_SECS`, and restore uses `--ignore-failed-sources` so an unreachable private feed cannot block indexing. Separately, warning-severity workspace diagnostics (e.g. "Found project reference without a matching metadata reference" for excluded or external projects) are benign resolution notes — they log at INFO and no longer pin the repo's index warning; only true load failures (minus NuGet audit advisories) still do.
 - **C# symbol indexing restores packages before the workspace load, and NuGet audit advisories no longer count as index warnings.** The design-time load does not restore: with stale or missing `project.assets.json`, package-typed references collapsed into CS0246 cascades that flagged whole solution families as degraded (⚠ in the serve TUI) even though `dotnet build` succeeds. The helper now runs `dotnet restore` before opening the solution (bounded, best effort — a failed restore logs and continues, degraded indexing beats no indexing), and when the bounded wait expires the restore is **not killed**: it keeps running in the background, this load proceeds degraded, and the next reindex picks up the fresh assets — a killed restore would waste all of its work and re-pay the same wait on every subsequent reindex. NuGet vulnerability advisories surfacing as Msbuild "failures" are filtered from the warning channel: they are security notes for the product, not index-health signals. Compiler *warnings* were already never counted; genuine project compilation errors still are, and indexing stays as complete as the broken projects allow.
+
+### Changed
+
+- **Dependency refresh:** libc 0.2.190, rmcp 3.5.0, uuid 1.27.0 (#305).
 
 ## [1.5.1] - 2026-10-04
 
@@ -372,6 +376,8 @@ finalized in place with a date — no renaming/migration step needed.
 
 ## [1.0.72] - 2026-05-01
 - Initial multi-repo release: multi-repo `serve` (HTTP/SSE, per-project/group routing, RRF cross-repo search), stdio MCP proxy with client-side auto-reconnect, tree-sitter chunking (9 langs), persistent SHA-256 embedding cache, repository groups, re-tuned RRF, and LMDB resize crash fix (#30, `MDB_MAP_FULL`).
+
+[1.5.2]: https://github.com/flupkede/codesearch/compare/v1.5.1...v1.5.2
 
 [1.5.1]: https://github.com/flupkede/codesearch/compare/v1.5.0...v1.5.1
 
