@@ -377,7 +377,10 @@ impl CodesearchService {
                     }
                     if let Some(chunk) = looked_up.ok().flatten() {
                         if relaxed_fallback
-                            && !chunk_covers_significant_terms(&chunk.content, &significant_terms)
+                            && !chunk_covers_significant_terms(
+                                relaxed_gate_text(&chunk),
+                                &significant_terms,
+                            )
                         {
                             continue 'outer;
                         }
@@ -454,7 +457,7 @@ impl CodesearchService {
                                 .filter(|(chunk, _)| {
                                     if relaxed_fallback
                                         && !chunk_covers_significant_terms(
-                                            &chunk.content,
+                                            relaxed_gate_text(chunk),
                                             &significant_terms,
                                         )
                                     {
@@ -642,7 +645,7 @@ const LITERAL_STOPWORDS: &[&str] = &[
 /// analyzer would (SimpleTokenizer splits on non-alphanumeric boundaries),
 /// dropping stopwords. This is the matched set and denominator for relaxed
 /// coverage.
-fn significant_query_terms(query: &str) -> Vec<String> {
+pub(crate) fn significant_query_terms(query: &str) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut terms = Vec::new();
     for raw in query.split(|c: char| !c.is_alphanumeric()) {
@@ -659,7 +662,7 @@ fn significant_query_terms(query: &str) -> Vec<String> {
 
 /// Relaxed-fallback gate: a candidate counts only when it holds at least two
 /// distinct significant terms and covers >=60% of them.
-fn chunk_covers_significant_terms(content: &str, terms: &[String]) -> bool {
+pub(crate) fn chunk_covers_significant_terms(content: &str, terms: &[String]) -> bool {
     if terms.len() < 2 {
         return false;
     }
@@ -669,4 +672,20 @@ fn chunk_covers_significant_terms(content: &str, terms: &[String]) -> bool {
         .collect();
     let matched = terms.iter().filter(|t| tokens.contains(*t)).count();
     matched >= 2 && matched * 10 >= terms.len() * 6
+}
+
+/// Text the relaxed-fallback gate matches against. The relaxed BM25 pass
+/// queries content, signature and kind fields (signature boosted 2.0), so a
+/// candidate is often rescued BY its signature — gating only on `content`
+/// then dropped exactly those candidates, defeating the fallback for the
+/// identifier queries it exists for. The gate therefore runs over the stored
+/// `searchable_text` (signature + docstring + content) when this index
+/// generation wrote one; legacy blobs predate the field (`#[serde(default)]`
+/// gives them an empty string) and fall back to bare content.
+pub(crate) fn relaxed_gate_text(chunk: &crate::vectordb::ChunkMetadata) -> &str {
+    if chunk.searchable_text.is_empty() {
+        &chunk.content
+    } else {
+        &chunk.searchable_text
+    }
 }

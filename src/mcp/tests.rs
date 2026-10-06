@@ -2214,6 +2214,76 @@ fn note_store_failure_survives_a_short_alias_list() {
     assert!(warnings[0].contains("unknown"));
 }
 
+// === relaxed-fallback coverage gate =====================================
+//
+// The relaxed BM25 pass rescues candidates via signature/kind matches, so
+// the coverage gate must see the same fields the rescue saw. These pin the
+// searchable_text gate text against both the signature-only candidate (the
+// exact misattribution class the fallback exists for) and legacy blobs that
+// predate the stored field.
+
+#[test]
+fn relaxed_gate_counts_signature_only_matches() {
+    use crate::vectordb::ChunkMetadata;
+
+    let chunk = ChunkMetadata {
+        content: "let x = compute();".to_string(),
+        path: "src/dispatch.rs".to_string(),
+        start_line: 0,
+        end_line: 2,
+        kind: "Function".to_string(),
+        signature: Some("fn transfer_overdue_process()".to_string()),
+        docstring: None,
+        context: None,
+        hash: String::new(),
+        context_prev: None,
+        context_next: None,
+        searchable_text: "fn transfer_overdue_process()\nFunction\nlet x = compute();".to_string(),
+    };
+    let terms =
+        super::literal_search::significant_query_terms("transfer overdue process");
+
+    // The signature carries all three terms; the gate over searchable_text
+    // must keep this candidate...
+    assert!(super::literal_search::chunk_covers_significant_terms(
+        super::literal_search::relaxed_gate_text(&chunk),
+        &terms,
+    ));
+    // ...while the old content-only gate dropped it — the self-defeating
+    // behaviour this fixes.
+    assert!(!super::literal_search::chunk_covers_significant_terms(
+        &chunk.content,
+        &terms,
+    ));
+}
+
+#[test]
+fn relaxed_gate_falls_back_to_content_for_legacy_blobs() {
+    use crate::vectordb::ChunkMetadata;
+
+    let chunk = ChunkMetadata {
+        content: "transfer_overdue_process(ctx)".to_string(),
+        path: "src/legacy.rs".to_string(),
+        start_line: 0,
+        end_line: 0,
+        kind: "Function".to_string(),
+        signature: Some("fn transfer_overdue_process(ctx)".to_string()),
+        docstring: None,
+        context: None,
+        hash: String::new(),
+        context_prev: None,
+        context_next: None,
+        searchable_text: String::new(),
+    };
+    let terms =
+        super::literal_search::significant_query_terms("transfer overdue process");
+
+    assert!(super::literal_search::chunk_covers_significant_terms(
+        super::literal_search::relaxed_gate_text(&chunk),
+        &terms,
+    ));
+}
+
 // === status(kind="index") multi-store summary ==========================
 //
 // Follow-up 16: a store failing mid-fan-out used to render identically to
