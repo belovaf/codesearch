@@ -4365,6 +4365,143 @@ async fn group_find_definition_attributes_hit_to_origin_repo_on_id_collision() {
     );
 }
 
+/// Group-scoped get_chunk must read surrounding lines from the OWNING repo's
+/// root. Stored chunk paths are project-relative, and the old context read
+/// joined them onto the serve process's own project_path after alias
+/// prefixing — a path that never exists — so every group answer came back
+/// with the "source file not readable" note and zero context. Here chunk id 5
+/// lives only in accounting-operations (bankruptcy holds just id 0), so the
+/// smart-candidate detection routes to the unique owner.
+#[tokio::test]
+async fn group_get_chunk_resolves_context_against_the_owning_repo_root() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root_a = tmp.path().join("accounting-operations");
+    let root_b = tmp.path().join("bankruptcy");
+    std::fs::create_dir_all(root_a.join("src/service")).unwrap();
+    std::fs::create_dir_all(&root_b).unwrap();
+
+    // The real source file the context read has to find.
+    std::fs::write(
+        root_a.join("src/service/TargetService.java"),
+        "line one\nline two\nTARGET LINE THREE\nTARGET LINE FOUR\nTARGET LINE FIVE\nline six\nline seven\nline eight\n",
+    )
+    .unwrap();
+
+    // Repo A: five filler chunks (ids 0..=4) then the target at id 5,
+    // spanning 0-based lines [2, 4] of the file above.
+    let db_a = root_a.join(DB_DIR_NAME);
+    std::fs::create_dir_all(&db_a).unwrap();
+    std::fs::write(
+        db_a.join("metadata.json"),
+        r#"{"schema_version":1,"dimensions":2,"model_short_name":"minilm-l6-q"}"#,
+    )
+    .unwrap();
+    let stores = crate::index::SharedStores::new(&db_a, 2).expect("shared stores");
+    {
+        let mut vs = stores.vector_store.write().await;
+        for i in 0..5u32 {
+            vs.insert_chunks(vec![crate::embed::EmbeddedChunk::new(
+                crate::chunker::Chunk::new(
+                    format!("filler {i}"),
+                    0,
+                    0,
+                    crate::chunker::ChunkKind::Comment,
+                    "src/Filler.java".to_string(),
+                ),
+                vec![0.25, 0.75],
+            )])
+            .expect("insert filler");
+        }
+        let mut target = crate::chunker::Chunk::new(
+            "TARGET LINE THREE\nTARGET LINE FOUR\nTARGET LINE FIVE".to_string(),
+            2,
+            4,
+            crate::chunker::ChunkKind::Function,
+            "src/service/TargetService.java".to_string(),
+        );
+        target.signature = Some("fn target()".to_string());
+        vs.insert_chunks(vec![crate::embed::EmbeddedChunk::new(target, vec![0.5, 0.5])])
+            .expect("insert target");
+        vs.build_index().expect("build index");
+    }
+    {
+        let mut fts = stores.fts_store.write().await;
+        fts.add_chunk(
+            5,
+            "target",
+            "src/service/TargetService.java",
+            Some("fn target()"),
+            "Function",
+        )
+        .expect("fts doc");
+        fts.commit().expect("fts commit");
+    }
+    drop(stores);
+
+    // Repo B holds only id 0, so chunk id 5 is unique to repo A.
+    seed_collision_repo(
+        &root_b,
+        "src/B.java",
+        crate::chunker::ChunkKind::Comment,
+        None,
+        "// b",
+    )
+    .await;
+
+    let mut config = ReposConfig::default();
+    config
+        .register_with_alias(root_a.clone(), Some("accounting-operations".to_string()))
+        .unwrap();
+    config
+        .register_with_alias(root_b.clone(), Some("bankruptcy".to_string()))
+        .unwrap();
+    config.groups.insert(
+        "uvz".to_string(),
+        vec![
+            "accounting-operations".to_string(),
+            "bankruptcy".to_string(),
+        ],
+    );
+    let config_file = tmp.path().join("repos.json");
+    config.save_to(&config_file).unwrap();
+    let state = std::sync::Arc::new(ServeState::new(config, Some(config_file)));
+    let service = crate::mcp::CodesearchService::new_for_serve(state).unwrap();
+
+    let req = crate::mcp::types::GetChunkRequest {
+        chunk_id: 5,
+        chunk_ref: None,
+        context_lines: Some(2),
+        project: None,
+        group: Some("uvz".to_string()),
+    };
+    let res = service
+        .get_chunk(Parameters(req))
+        .await
+        .expect("group get_chunk must succeed");
+    let text = tool_text(&res);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|_| panic!("non-JSON answer: {text}"));
+
+    assert_eq!(
+        parsed["path"], "accounting-operations/src/service/TargetService.java",
+        "got: {text}"
+    );
+    assert_eq!(
+        parsed["context_before"], "line one\nline two",
+        "context above must come from the owning repo's real file: {text}"
+    );
+    assert_eq!(
+        parsed["context_after"], "TARGET LINE FIVE\nline six",
+        "context below must come from the owning repo's real file: {text}"
+    );
+    assert!(
+        parsed.get("note").is_none(),
+        "the context read resolved — no fallback note expected, got: {text}"
+    );
+}
+
 #[tokio::test]
 async fn group_literal_search_attributes_each_hit_to_its_origin_repo() {
     use rmcp::handler::server::wrapper::Parameters;

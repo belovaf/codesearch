@@ -101,6 +101,16 @@ impl CodesearchService {
         // Look up chunk — multi-store: smart candidate detection for chunk_id collision.
         // chunk_ids are local per database, not globally unique. When no project is specified
         // and multiple stores are active, scan all stores to find which ones have this chunk_id.
+        //
+        // The store that answers becomes `owner_alias` so the context read below
+        // can resolve the project-relative stored path against the OWNING
+        // repo's root (`ctx.alias_roots`) — the serve process's own
+        // project_path is not any repo's root, so joining there always failed
+        // and group-scoped answers never carried surrounding lines.
+        // `stored_path_raw` is published only by the unique-owner group arm,
+        // which prefixes chunk.path inside itself before returning.
+        let mut owner_alias: Option<String> = None;
+        let mut stored_path_raw: Option<String> = None;
         let chunk = if let Some(ref sv) = ctx.stores_vec {
             if sv.len() > 1 && request.project.is_none() {
                 // Smart candidate detection: find which stores actually contain this chunk_id
@@ -181,6 +191,8 @@ impl CodesearchService {
                             .unwrap_or("");
                         match store.as_ref().map(|s| s.get_chunk(request.chunk_id)) {
                             Some(Ok(Some(mut c))) => {
+                                owner_alias = Some(alias.clone());
+                                stored_path_raw = Some(c.path.clone());
                                 c.path = prefix_path_with_alias(&c.path, Some(alias), root);
                                 Some(c)
                             }
@@ -227,6 +239,7 @@ impl CodesearchService {
                     };
                     match store.get_chunk(request.chunk_id) {
                         Ok(Some(c)) => {
+                            owner_alias = aliases.get(i).cloned();
                             found = Some(c);
                             break;
                         }
@@ -250,7 +263,10 @@ impl CodesearchService {
                 )
                 .await
             {
-                Ok(c) => c,
+                Ok(c) => {
+                    owner_alias = ctx.project_alias.clone();
+                    c
+                }
                 Err(e) => {
                     push_store_warning(
                         &mut chunk_warnings,
@@ -280,6 +296,14 @@ impl CodesearchService {
             }
         };
 
+        // The ORIGINAL project-relative stored path for the context read
+        // below, captured before display prefixing rewrites chunk.path. The
+        // group's unique-owner arm already rewrote its chunk's path inside
+        // itself, so it publishes the pre-prefix copy via `stored_path_raw`.
+        let stored_path = stored_path_raw
+            .take()
+            .unwrap_or_else(|| chunk.path.clone());
+
         // Prefix path with alias for multi-repo identification
         chunk.path = ctx.prefix_result_path(&chunk.path);
 
@@ -288,9 +312,19 @@ impl CodesearchService {
         let mut note = None;
 
         if context_lines > 0 {
-            // Resolve relative chunk paths against project root (not process CWD).
+            // Resolve relative chunk paths against the OWNING repo's root —
+            // chunk paths are project-relative, and in serve mode the service's
+            // own project_path is not that repo's root, so the old join never
+            // found the file. Stdio single-repo mode has no alias roots and
+            // keeps the historical project_path join.
             let source_path = if Path::new(&chunk.path).is_absolute() {
                 PathBuf::from(&chunk.path)
+            } else if let Some(root) = owner_alias
+                .as_deref()
+                .and_then(|alias| ctx.alias_roots.get(alias))
+                .filter(|root| !root.is_empty())
+            {
+                Path::new(root).join(stored_path.trim_start_matches('/'))
             } else {
                 self.project_path.join(&chunk.path)
             };
