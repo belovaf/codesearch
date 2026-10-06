@@ -840,13 +840,24 @@ impl VectorStore {
             ));
         }
 
+        let rtxn = self.env.read_txn()?;
+
         if !self.indexed {
+            // An indexing run that ends with zero embeddable files never
+            // builds the arroy tree; such repos are normal (packaging junk,
+            // docs-only trees), so an empty store must answer "no hits", not
+            // an error — otherwise every group fan-out reported each empty
+            // repo as a per-repo failure on every query. Chunks present
+            // without a graph stays a loud error: that is data missing its
+            // index, not an empty repo.
+            if self.chunks.last(&rtxn)?.is_none() {
+                return Ok(Vec::new());
+            }
             return Err(anyhow!(
                 "Index not built. Call build_index() after inserting chunks."
             ));
         }
 
-        let rtxn = self.env.read_txn()?;
         let reader = Reader::open(&rtxn, 0, self.vectors)?;
 
         // Perform ANN search with quality boost
@@ -1500,6 +1511,49 @@ mod tests {
         assert_eq!(
             store.next_id, before,
             "ids consumed by the aborted attempt must be handed back"
+        );
+    }
+
+    /// Empty-but-complete: a store whose indexing ended with zero chunks
+    /// never built the arroy tree. Such a repo is normal (packaging junk,
+    /// docs-only trees) and must answer queries with an empty vec — the old
+    /// hard error made every group fan-out report each empty repo as a
+    /// per-repo failure on every query.
+    #[test]
+    fn search_on_a_chunkless_store_returns_empty_instead_of_an_error() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("empty.db");
+        let store = VectorStore::new(&db_path, 4).unwrap();
+        assert!(
+            !store.is_indexed(),
+            "fixture: nothing was ever inserted or built"
+        );
+
+        let hits = store
+            .search(&[0.1, 0.2, 0.3, 0.4], 10)
+            .expect("an empty store is searchable, it just finds nothing");
+        assert!(hits.is_empty());
+    }
+
+    /// Chunks without a graph is a genuinely broken state (crashed build,
+    /// partial index) and must stay loud — silently empty would hide data
+    /// loss behind what looks like "no match in this repo".
+    #[test]
+    fn search_with_chunks_but_no_graph_still_errors() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("unbuilt.db");
+        let mut store = VectorStore::new(&db_path, 4).unwrap();
+        store
+            .insert_chunks_with_ids(vec![drift_chunk("src/a.rs", "fn a() {}", 0)])
+            .expect("insert");
+        assert!(!store.is_indexed());
+
+        let err = store
+            .search(&[0.1, 0.2, 0.3, 0.4], 10)
+            .expect_err("chunks present without a graph must fail loudly");
+        assert!(
+            format!("{err:#}").contains("Index not built"),
+            "got: {err:#}"
         );
     }
 
