@@ -200,6 +200,7 @@ TUI `i` overlay. The TUI discovery tick is config-only (zero HTTP).
 
 ## Notes for agents
 
+- **Before direct git work in this checkout, force `git config core.bare false`.** This repo is a bare+working-tree hybrid (`codesearch.git` holds a full checkout) and VS Code's git integration intermittently resets `core.bare` to `true` on ref changes, breaking every git operation outside `build.ps1`/`copy-to-common.ps1` (both self-heal it before building). Symptom: "fatal: this operation must be run in a work tree" from an otherwise intact checkout.
 - **Never use the bundled `codesearch` binary to investigate this repo** (it is the project under development). Use codesearch MCP tools first for discovery (this repo is indexed as `codesearch-git`); `grep`/`Read` for exact refs, other git refs, or when MCP returns nothing.
 - **Tests live in sibling `_tests.rs` files**, table-driven preferred over near-duplicate per-case fns.
 - **Tests that set env vars must be `#[serial]`** and set them via `crate::testing::EnvRestore` — cargo runs tests as parallel threads of one process, so an unserialised `set_var` races every reader.
