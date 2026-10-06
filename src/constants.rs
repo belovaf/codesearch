@@ -583,6 +583,21 @@ pub const STORE_LOCK_WAIT_SECS: u64 = 300;
 /// Environment variable overriding [`STORE_LOCK_WAIT_SECS`].
 pub const STORE_LOCK_WAIT_SECS_ENV: &str = "CODESEARCH_STORE_LOCK_WAIT_SECS";
 
+/// How long a lazy embedding-model load may take before it is abandoned
+/// with an actionable error.
+///
+/// `EmbeddingService::with_cache_dir` resolves model files through hf-hub,
+/// which on a cold cache means a network download. On networks that
+/// black-hole the model host this fetch never completes — and never errors —
+/// so an unbounded load wedges every caller stuck on the model's init lock
+/// (observed as a whole-night serve stall). The bound turns that into a
+/// fail-fast error pointing at `codesearch setup`; generous enough to let a
+/// legitimate first-time download through.
+pub const MODEL_LOAD_TIMEOUT_SECS: u64 = 600;
+
+/// Environment variable overriding [`MODEL_LOAD_TIMEOUT_SECS`].
+pub const MODEL_LOAD_TIMEOUT_SECS_ENV: &str = "CODESEARCH_MODEL_LOAD_TIMEOUT_SECS";
+
 /// Total number of attempts (initial request + retries) the federation client
 /// makes against a remote peer that answers with a transient HTTP status
 /// (502/503/504). Federated peers commonly run on scale-to-zero hosts (Azure
