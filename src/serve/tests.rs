@@ -302,6 +302,40 @@ async fn remove_repo_quarantines_db_dir_when_delete_budget_expires() {
 }
 
 #[test]
+fn sweep_removes_quarantine_remnants_and_leaves_everything_else() {
+    // The quarantine rename leaves the survivor "for manual cleanup", and
+    // manual cleanup never happens — every budget-expired delete leaked a
+    // full stale index copy forever. The startup sweep is the cleanup:
+    // by serve start the previous session's external holders are gone, so
+    // the tombstone has no readers left to protect.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+
+    let remnant = repo.join(format!("{DB_DIR_NAME}.removed-1700000000000"));
+    std::fs::create_dir_all(&remnant).unwrap();
+    std::fs::write(remnant.join("metadata.json"), "{}").unwrap();
+    let live_db = repo.join(DB_DIR_NAME);
+    std::fs::create_dir_all(&live_db).unwrap();
+    // Similar name, different prefix family — must not be touched.
+    let other = repo.join("notes.removed-manual");
+    std::fs::create_dir_all(&other).unwrap();
+
+    crate::serve::sweep_quarantined_db_remnants(&[repo.clone()]);
+
+    assert!(
+        !remnant.exists(),
+        "the .codesearch.db.removed-* sibling must be swept"
+    );
+    assert!(live_db.exists(), "the live db dir must stay untouched");
+    assert!(other.exists(), "unrelated .removed names must not be touched");
+
+    // A repo path that cannot be listed warns but does not panic.
+    let missing = tmp.path().join("gone");
+    crate::serve::sweep_quarantined_db_remnants(&[missing]);
+}
+
+#[test]
 fn remove_orphaned_db_dir_deletes_a_present_directory() {
     // Regression guard for the self-cleanup backstop: when a background
     // indexing task finishes an uninterruptible `build_index` for an alias

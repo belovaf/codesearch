@@ -6333,6 +6333,52 @@ fn keep_warm_foreign_target(ping_url: &str, self_host: &str) -> Option<String> {
     }
 }
 
+// Best-effort startup sweep of quarantined DB remnants. remove_repo's
+// delete-budget fallback renames a surviving db dir aside as
+// `<DB_DIR_NAME>.removed-<unix_ms>` "for manual cleanup" — and manual is
+// exactly what never happened, so every budget-expired delete leaked a
+// full stale index copy forever. By startup the external holders that
+// forced the rename (AV scanner, another process) have exited with the
+// previous session, so the tombstone has no readers left to protect:
+// serve deletes the remnants on its way up. Failures warn and never
+// block startup — a remnant that still cannot be removed just waits for
+// the next restart.
+pub(crate) fn sweep_quarantined_db_remnants(repo_paths: &[PathBuf]) {
+    let prefix = format!("{DB_DIR_NAME}.removed-");
+    for repo_path in repo_paths {
+        let entries = match std::fs::read_dir(repo_path) {
+            Ok(entries) => entries,
+            Err(e) => {
+                warn!(
+                    "quarantine sweep: failed to list {}: {}",
+                    repo_path.display(),
+                    e
+                );
+                continue;
+            }
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !name.starts_with(&prefix) {
+                continue;
+            }
+            let remnant = entry.path();
+            match std::fs::remove_dir_all(&remnant) {
+                Ok(()) => info!(
+                    "🧹 swept quarantined db remnant at startup: {}",
+                    remnant.display()
+                ),
+                Err(e) => warn!(
+                    "quarantine sweep: could not remove {} (will retry next startup): {}",
+                    remnant.display(),
+                    e
+                ),
+            }
+        }
+    }
+}
+
 // `run_serve` is the single startup entry point, so its parameter list is the
 // serve CLI surface (bind host/port, registration, default model, TUI,
 // keep-warm, shutdown). Bundling them into a struct would only move the
@@ -6458,6 +6504,13 @@ pub async fn run_serve(
             }
         }
     });
+
+    // Startup sweep of quarantined DB remnants — the `.removed-*` siblings
+    // remove_repo's delete-budget fallback leaves "for manual cleanup". Run
+    // on its own blocking task: never blocks the listener, and a leftover
+    // holder just means the remnant waits for the next restart.
+    let sweep_repo_paths: Vec<PathBuf> = config.repos.values().cloned().collect();
+    tokio::task::spawn_blocking(move || sweep_quarantined_db_remnants(&sweep_repo_paths));
 
     // The explicit `--model` flag wins; otherwise adopt the choice persisted
     // by `codesearch setup`. Without this bridge the pilot operator had to
