@@ -86,12 +86,14 @@ impl CodesearchService {
             let mut seen_ids: std::collections::HashSet<(usize, u32)> =
                 std::collections::HashSet::new();
             for (store_idx, store_arc) in sv.iter().enumerate() {
-                let store = match bounded_vector_read(&store_arc.vector_store).await {
-                    Ok(store) => store,
-                    Err(e) => {
-                        note_store_failure(warnings, aliases, store_idx, "outline scan", &e);
-                        continue;
-                    }
+                let Some(store) = try_vector_read_or_note(
+                    &store_arc.vector_store,
+                    aliases,
+                    store_idx,
+                    warnings,
+                    "outline scan",
+                ) else {
+                    continue;
                 };
                 match store.chunks_for_file(normalized) {
                     Ok(metas) => {

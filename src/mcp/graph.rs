@@ -62,18 +62,14 @@ impl CodesearchService {
             let mut seen_ids: std::collections::HashSet<(usize, u32)> =
                 std::collections::HashSet::new();
             for (store_idx, store_arc) in sv.iter().enumerate() {
-                let store = match bounded_vector_read(&store_arc.vector_store).await {
-                    Ok(store) => store,
-                    Err(e) => {
-                        note_store_failure(
-                            &mut import_warnings,
-                            import_aliases,
-                            store_idx,
-                            "chunk lookup",
-                            &e,
-                        );
-                        continue;
-                    }
+                let Some(store) = try_vector_read_or_note(
+                    &store_arc.vector_store,
+                    import_aliases,
+                    store_idx,
+                    &mut import_warnings,
+                    "chunk lookup",
+                ) else {
+                    continue;
                 };
                 match store.chunks_for_file(&normalized) {
                     Ok(metas) => {
@@ -182,18 +178,14 @@ impl CodesearchService {
                         continue;
                     };
                     let store_arc = &sv[origin_idx];
-                    let store = match bounded_vector_read(&store_arc.vector_store).await {
-                        Ok(store) => store,
-                        Err(e) => {
-                            note_store_failure(
-                                &mut import_warnings,
-                                import_aliases,
-                                origin_idx,
-                                "chunk lookup",
-                                &e,
-                            );
-                            continue;
-                        }
+                    let Some(store) = try_vector_read_or_note(
+                        &store_arc.vector_store,
+                        import_aliases,
+                        origin_idx,
+                        &mut import_warnings,
+                        "chunk lookup",
+                    ) else {
+                        continue;
                     };
                     match store.get_chunk(hit.result.chunk_id) {
                         Ok(Some(chunk)) => {
@@ -423,18 +415,14 @@ impl CodesearchService {
                     continue;
                 };
                 let store_arc = &sv[origin_idx];
-                let store = match bounded_vector_read(&store_arc.vector_store).await {
-                    Ok(store) => store,
-                    Err(e) => {
-                        note_store_failure(
-                            &mut dep_warnings,
-                            dep_aliases,
-                            origin_idx,
-                            "chunk lookup",
-                            &e,
-                        );
-                        continue;
-                    }
+                let Some(store) = try_vector_read_or_note(
+                    &store_arc.vector_store,
+                    dep_aliases,
+                    origin_idx,
+                    &mut dep_warnings,
+                    "chunk lookup",
+                ) else {
+                    continue;
                 };
                 match store.get_chunk(f.result.chunk_id) {
                     Ok(Some(chunk)) => {
@@ -596,18 +584,14 @@ impl CodesearchService {
             let aliases = ctx.aliases();
             let mut candidates: Vec<(usize, Vec<f32>)> = Vec::new();
             for (i, store_arc) in sv.iter().enumerate() {
-                let store = match bounded_vector_read(&store_arc.vector_store).await {
-                    Ok(store) => store,
-                    Err(e) => {
-                        note_store_failure(
-                            &mut similar_warnings,
-                            aliases,
-                            i,
-                            "embedding lookup",
-                            &e,
-                        );
-                        continue;
-                    }
+                let Some(store) = try_vector_read_or_note(
+                    &store_arc.vector_store,
+                    aliases,
+                    i,
+                    &mut similar_warnings,
+                    "embedding lookup",
+                ) else {
+                    continue;
                 };
                 match store.get_embedding(request.chunk_id) {
                     Ok(Some(emb)) => candidates.push((i, emb)),
@@ -669,12 +653,14 @@ impl CodesearchService {
                     .get(store_idx)
                     .map(String::as_str)
                     .unwrap_or_default();
-                let store = match bounded_vector_read(&store_arc.vector_store).await {
-                    Ok(store) => store,
-                    Err(e) => {
-                        note_store_failure(&mut similar_warnings, aliases, store_idx, "search", &e);
-                        continue;
-                    }
+                let Some(store) = try_vector_read_or_note(
+                    &store_arc.vector_store,
+                    aliases,
+                    store_idx,
+                    &mut similar_warnings,
+                    "search",
+                ) else {
+                    continue;
                 };
                 match store.search(&embedding, limit + 1) {
                     Ok(mut neighbors) => {

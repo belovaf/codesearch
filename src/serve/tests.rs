@@ -4273,6 +4273,16 @@ async fn seed_collision_repo(
 /// the fix) has a prose comment mentioning the symbol, `bankruptcy` holds the
 /// real Java interface definition.
 async fn colliding_group_fixture() -> (tempfile::TempDir, crate::mcp::CodesearchService) {
+    let (tmp, _state, service) = colliding_group_fixture_with_state().await;
+    (tmp, service)
+}
+
+/// Same fixture, keeping the `ServeState` handle so tests can reach the very
+/// `SharedStores` instances routing opens (`get_opened_stores`) and hold
+/// their vector write guards — a fresh `SharedStores::new` would build other
+/// RwLocks and the held guard would gate nothing.
+async fn colliding_group_fixture_with_state()
+-> (tempfile::TempDir, std::sync::Arc<ServeState>, crate::mcp::CodesearchService) {
     let tmp = tempfile::tempdir().unwrap();
     let root_a = tmp.path().join("accounting-operations");
     let root_b = tmp.path().join("bankruptcy");
@@ -4313,8 +4323,8 @@ async fn colliding_group_fixture() -> (tempfile::TempDir, crate::mcp::Codesearch
     let config_file = tmp.path().join("repos.json");
     config.save_to(&config_file).unwrap();
     let state = std::sync::Arc::new(ServeState::new(config, Some(config_file)));
-    let service = crate::mcp::CodesearchService::new_for_serve(state).unwrap();
-    (tmp, service)
+    let service = crate::mcp::CodesearchService::new_for_serve(state.clone()).unwrap();
+    (tmp, state, service)
 }
 
 fn tool_text(res: &rmcp::model::CallToolResult) -> String {
@@ -4499,6 +4509,184 @@ async fn group_get_chunk_resolves_context_against_the_owning_repo_root() {
     assert!(
         parsed.get("note").is_none(),
         "the context read resolved — no fallback note expected, got: {text}"
+    );
+}
+
+// ═══ Interactive fan-outs skip busy stores instead of queueing behind the
+// write lock (review cluster B). The priming call opens the group's stores
+// so `get_opened_stores` hands back the SAME SharedStores the handlers
+// resolve; holding its vector write guard then reproduces an active indexing
+// run. A regression to bounded waits wedges each test on the 300 s lock
+// timeout instead of returning the skip-with-warning answer asserted here.
+
+#[tokio::test]
+async fn group_find_skips_a_write_locked_store_instead_of_waiting() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    let (_tmp, state, service) = colliding_group_fixture_with_state().await;
+
+    // Prime routing so the group's stores are opened and lockable.
+    let prime = crate::mcp::types::FindRequest {
+        kind: Some("definition".to_string()),
+        symbol: "BankruptcyFolderService".to_string(),
+        definition_kind: None,
+        limit: Some(10),
+        project: None,
+        group: Some("uvz".to_string()),
+    };
+    service
+        .find(Parameters(prime))
+        .await
+        .expect("priming find must succeed");
+
+    let alpha = state
+        .get_opened_stores("accounting-operations")
+        .expect("priming call must open accounting-operations");
+    let _guard = alpha.vector_store.write().await;
+
+    let request = crate::mcp::types::FindRequest {
+        kind: Some("definition".to_string()),
+        symbol: "BankruptcyFolderService".to_string(),
+        definition_kind: None,
+        limit: Some(10),
+        project: None,
+        group: Some("uvz".to_string()),
+    };
+    let res = service
+        .find(Parameters(request))
+        .await
+        .expect("group find must succeed without waiting on the locked store");
+    let text = tool_text(&res);
+
+    // The healthy repo still answers; the busy one is named in `warnings`,
+    // not silently folded into a plausible-looking short result list.
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|_| panic!("non-JSON answer: {text}"));
+    let items = parsed
+        .as_object()
+        .and_then(|o| o.get("results"))
+        .and_then(|r| r.as_array())
+        .unwrap_or_else(|| panic!("expected a {{results, warnings}} object, got: {text}"));
+    assert_eq!(
+        items.len(),
+        1,
+        "only the bankruptcy definition must be reported, got: {text}"
+    );
+    assert_eq!(
+        items[0]["path"],
+        "bankruptcy/src/main/java/ru/sberbank/bankruptcy/BankruptcyFolderService.java",
+        "got: {text}"
+    );
+    assert!(
+        text.contains("store busy") && text.contains("accounting-operations"),
+        "the skipped repo must be named with a store-busy warning, got: {text}"
+    );
+}
+
+#[tokio::test]
+async fn group_get_chunk_skips_a_write_locked_candidate_repo() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    let (_tmp, state, service) = colliding_group_fixture_with_state().await;
+
+    // Prime routing so the group's stores are opened and lockable.
+    let prime = crate::mcp::types::FindRequest {
+        kind: Some("definition".to_string()),
+        symbol: "BankruptcyFolderService".to_string(),
+        definition_kind: None,
+        limit: Some(10),
+        project: None,
+        group: Some("uvz".to_string()),
+    };
+    service
+        .find(Parameters(prime))
+        .await
+        .expect("priming find must succeed");
+
+    let alpha = state
+        .get_opened_stores("accounting-operations")
+        .expect("priming call must open accounting-operations");
+    let _guard = alpha.vector_store.write().await;
+
+    // Both repos hold id 0; with accounting-operations locked, the candidate
+    // scan must skip it (not wait) and auto-route to bankruptcy alone.
+    let req = crate::mcp::types::GetChunkRequest {
+        chunk_id: 0,
+        chunk_ref: None,
+        context_lines: None,
+        project: None,
+        group: Some("uvz".to_string()),
+    };
+    let res = service
+        .get_chunk(Parameters(req))
+        .await
+        .expect("group get_chunk must succeed without waiting on the locked store");
+    let text = tool_text(&res);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|_| panic!("non-JSON answer: {text}"));
+
+    assert_eq!(
+        parsed["path"],
+        "bankruptcy/src/main/java/ru/sberbank/bankruptcy/BankruptcyFolderService.java",
+        "the only answering candidate must own the answer, got: {text}"
+    );
+    assert!(
+        text.contains("store busy") && text.contains("accounting-operations"),
+        "the skipped candidate must be named with a store-busy warning, got: {text}"
+    );
+}
+
+#[tokio::test]
+async fn group_similar_skips_a_write_locked_store_instead_of_waiting() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    let (_tmp, state, service) = colliding_group_fixture_with_state().await;
+
+    // Prime routing so the group's stores are opened and lockable; the
+    // unprimed answer would be an id-0 ambiguity report, which is fine —
+    // only the side effect (stores opened) matters here.
+    let prime = crate::mcp::types::ExploreRequest {
+        kind: Some("similar".to_string()),
+        target: "0".to_string(),
+        limit: Some(5),
+        project: None,
+        group: Some("uvz".to_string()),
+    };
+    service
+        .explore(Parameters(prime))
+        .await
+        .expect("priming explore must succeed");
+
+    let alpha = state
+        .get_opened_stores("accounting-operations")
+        .expect("priming call must open accounting-operations");
+    let _guard = alpha.vector_store.write().await;
+
+    // Covers BOTH converted fan-out sites of similar_chunks in one call:
+    // the embedding lookup and the neighbour search both try-lock alpha.
+    let req = crate::mcp::types::SimilarChunksRequest {
+        chunk_id: 0,
+        limit: Some(5),
+        project: None,
+        group: Some("uvz".to_string()),
+    };
+    let res = service
+        .similar_chunks(Parameters(req))
+        .await
+        .expect("group similar must succeed without waiting on the locked store");
+    let text = tool_text(&res);
+
+    // The embedding resolves against bankruptcy alone (unique holder), and
+    // its neighbour set is just the source chunk itself — filtered out — so
+    // the answer is the empty message PLUS the store-busy warnings naming
+    // the skipped repo.
+    assert!(
+        text.contains("No similar chunks found for chunk_id 0"),
+        "expected the empty-result answer from the sole answering repo, got: {text}"
+    );
+    assert!(
+        text.contains("store busy") && text.contains("accounting-operations"),
+        "the skipped repo must be named with a store-busy warning, got: {text}"
     );
 }
 

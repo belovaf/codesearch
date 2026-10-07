@@ -100,9 +100,14 @@ impl CodesearchService {
                         .get(store_idx)
                         .map(String::as_str)
                         .unwrap_or_default();
-                    let store = match bounded_vector_read(&store_arc.vector_store).await {
-                        Ok(store) => store,
-                        Err(_) => continue,
+                    let Some(store) = try_vector_read_or_note(
+                        &store_arc.vector_store,
+                        scan_aliases,
+                        store_idx,
+                        &mut literal_warnings,
+                        "chunk scan",
+                    ) else {
+                        continue;
                     };
                     let all_chunks = match store.iter_all_chunks() {
                         Ok(chunks) => chunks,
@@ -358,18 +363,14 @@ impl CodesearchService {
                         continue 'outer;
                     };
                     let store_arc = &sv[origin_idx];
-                    let store = match bounded_vector_read(&store_arc.vector_store).await {
-                        Ok(store) => store,
-                        Err(e) => {
-                            note_store_failure(
-                                &mut literal_warnings,
-                                sa,
-                                origin_idx,
-                                "chunk lookup",
-                                &e,
-                            );
-                            continue 'outer;
-                        }
+                    let Some(store) = try_vector_read_or_note(
+                        &store_arc.vector_store,
+                        sa,
+                        origin_idx,
+                        &mut literal_warnings,
+                        "chunk lookup",
+                    ) else {
+                        continue 'outer;
                     };
                     let looked_up = store.get_chunk(fts_hit.result.chunk_id);
                     if let Err(ref e) = looked_up {

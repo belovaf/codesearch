@@ -117,12 +117,18 @@ impl CodesearchService {
                 let mut candidates: Vec<(&Arc<SharedStores>, String)> = Vec::new();
                 let aliases = ctx.aliases();
                 for (i, store_arc) in sv.iter().enumerate() {
-                    let store = match bounded_vector_read(&store_arc.vector_store).await {
-                        Ok(store) => store,
-                        Err(e) => {
-                            note_store_failure(&mut chunk_warnings, aliases, i, "chunk lookup", &e);
-                            continue;
-                        }
+                    // Try-lock, never wait: this loop scans EVERY repo in the
+                    // group, so bounded waits summed to N×300 s while a single
+                    // indexing run held them — the same interactive wedge the
+                    // search fan-outs killed.
+                    let Some(store) = try_vector_read_or_note(
+                        &store_arc.vector_store,
+                        aliases,
+                        i,
+                        &mut chunk_warnings,
+                        "chunk lookup",
+                    ) else {
+                        continue;
                     };
                     match store.get_chunk(request.chunk_id) {
                         Ok(Some(_)) => {
@@ -169,12 +175,21 @@ impl CodesearchService {
                             serve_state.record_tool_call(alias, "get_chunk");
                             serve_state.touch_access(alias);
                         }
-                        let store = match bounded_vector_read(&store_arc.vector_store).await {
+                        // Try-lock like the scan above: the store answered the
+                        // scan moments ago; waiting here reintroduces the very
+                        // wedge the scan just removed whenever indexing took
+                        // the lock in between.
+                        let store = match store_arc.vector_store.try_read() {
                             Ok(store) => Some(store),
-                            Err(e) => {
+                            Err(_) => {
                                 push_store_warning(
                                     &mut chunk_warnings,
-                                    &store_warning(alias, "chunk lookup", &format!("{e:#}")),
+                                    &store_warning(
+                                        alias,
+                                        "chunk lookup",
+                                        "store busy: active indexing holds the write lock — \
+                                         repo skipped in this fan-out, retry shortly",
+                                    ),
                                 );
                                 None
                             }

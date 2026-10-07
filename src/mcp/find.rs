@@ -179,18 +179,14 @@ impl CodesearchService {
                     continue 'outer;
                 };
                 let store_arc = &sv[origin_idx];
-                let store = match bounded_vector_read(&store_arc.vector_store).await {
-                    Ok(store) => store,
-                    Err(e) => {
-                        note_store_failure(
-                            &mut find_warnings,
-                            aliases,
-                            origin_idx,
-                            "chunk lookup",
-                            &e,
-                        );
-                        continue 'outer;
-                    }
+                let Some(store) = try_vector_read_or_note(
+                    &store_arc.vector_store,
+                    aliases,
+                    origin_idx,
+                    &mut find_warnings,
+                    "chunk lookup",
+                ) else {
+                    continue 'outer;
                 };
                 match store.get_chunk(fts_hit.result.chunk_id) {
                     Ok(Some(chunk)) => {
@@ -397,18 +393,14 @@ impl CodesearchService {
                     continue;
                 };
                 let store_arc = &sv[origin_idx];
-                let store = match bounded_vector_read(&store_arc.vector_store).await {
-                    Ok(store) => store,
-                    Err(e) => {
-                        note_store_failure(
-                            &mut find_warnings,
-                            aliases,
-                            origin_idx,
-                            "chunk lookup",
-                            &e,
-                        );
-                        continue;
-                    }
+                let Some(store) = try_vector_read_or_note(
+                    &store_arc.vector_store,
+                    aliases,
+                    origin_idx,
+                    &mut find_warnings,
+                    "chunk lookup",
+                ) else {
+                    continue;
                 };
                 match store.get_chunk(fts_hit.result.chunk_id) {
                     Ok(Some(chunk)) => {

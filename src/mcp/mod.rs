@@ -74,6 +74,43 @@ pub(crate) async fn bounded_fts_read(
     })
 }
 
+/// Try-lock a vector store for an INTERACTIVE multi-repo fan-out, skipping
+/// and reporting a busy repo instead of waiting for it.
+///
+/// Every interactive multi-store handler (find, graph, explore, get_chunk,
+/// the literal metadata lookups) runs on an agent's request path: waits sum
+/// per busy store — N repos held by an indexing run meant N×300 s — the
+/// exact interactive wedge the search fan-outs already killed with try_read.
+/// Single-store paths (`with_*_store_read_for`, project-scoped queries) keep
+/// the bounded wait by design: one repo, no summation.
+///
+/// Returns `None` after appending the same "store busy" warning the search
+/// fan-outs emit, so every skipped repo is named in the response.
+pub(crate) fn try_vector_read_or_note<'a>(
+    lock: &'a tokio::sync::RwLock<VectorStore>,
+    aliases: &[String],
+    idx: usize,
+    warnings: &mut Vec<String>,
+    what: &str,
+) -> Option<tokio::sync::RwLockReadGuard<'a, VectorStore>> {
+    match lock.try_read() {
+        Ok(store) => Some(store),
+        Err(_) => {
+            note_store_failure(
+                warnings,
+                aliases,
+                idx,
+                what,
+                &anyhow::anyhow!(
+                    "store busy: active indexing holds the write lock — \
+                     repo skipped in this fan-out, retry shortly"
+                ),
+            );
+            None
+        }
+    }
+}
+
 use crate::db_discovery::{find_best_database, load_repos_config};
 use crate::embed::{EmbeddingServicePool, ModelType};
 use crate::file::Language;
