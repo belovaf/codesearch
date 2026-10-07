@@ -2284,6 +2284,89 @@ fn relaxed_gate_falls_back_to_content_for_legacy_blobs() {
     ));
 }
 
+// === unified search dispatch: min_score honesty ========================
+//
+// min_score used to be silently ignored on the literal path and dropped on
+// both federated legs; the tool advertised it anyway. These pin the
+// by-name refusal and the peer body composition.
+
+#[test]
+fn build_remote_search_body_forwards_min_score_to_peers() {
+    let request = crate::mcp::types::SearchRequest {
+        query: "transfer overdue".to_string(),
+        mode: Some("semantic".to_string()),
+        compact: None,
+        semantic_mode: None,
+        filter_path: None,
+        min_score: Some(0.42),
+        regex: None,
+        phrase: None,
+        file_glob: None,
+        language: None,
+        format: None,
+        limit: None,
+        project: None,
+        group: None,
+    };
+    let body =
+        super::CodesearchService::build_remote_search_body(&request, "semantic", Some(50));
+    let got = body["min_score"]
+        .as_f64()
+        .expect("min_score must be numeric in the peer body");
+    assert!(
+        (got - 0.42).abs() < 1e-6,
+        "body must forward min_score: {body}"
+    );
+    assert_eq!(body["mode"], "semantic", "body must keep its shape: {body}");
+}
+
+#[tokio::test]
+async fn search_refuses_min_score_in_literal_mode_by_name() {
+    use rmcp::handler::server::wrapper::Parameters;
+
+    // Minimal hermetic service fixture: the refusal fires before any store
+    // access, so an empty index is enough.
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join(".codesearch.db");
+    std::fs::create_dir_all(&db).unwrap();
+    std::fs::write(
+        db.join("metadata.json"),
+        r#"{"schema_version":1,"dimensions":2,"model_short_name":"minilm-l6-q"}"#,
+    )
+    .unwrap();
+    let stores = std::sync::Arc::new(crate::index::SharedStores::new(&db, 2).expect("stores"));
+    let service =
+        super::CodesearchService::new_with_stores(Some(tmp.path().to_path_buf()), Some(stores))
+            .expect("service");
+
+    let request = crate::mcp::types::SearchRequest {
+        query: "handle_transfer".to_string(),
+        mode: Some("literal".to_string()),
+        compact: None,
+        semantic_mode: None,
+        filter_path: None,
+        min_score: Some(0.5),
+        regex: None,
+        phrase: None,
+        file_glob: None,
+        language: None,
+        format: None,
+        limit: None,
+        project: None,
+        group: None,
+    };
+    let res = service
+        .search(Parameters(request))
+        .await
+        .expect("search must answer");
+    let text = match res.content.first() {
+        Some(rmcp::model::ContentBlock::Text(t)) => t.text.clone(),
+        other => panic!("expected text content, got {other:?}"),
+    };
+    assert!(text.contains("min_score"), "refusal must name the field: {text}");
+    assert!(text.contains("literal"), "refusal must name the mode: {text}");
+}
+
 // === status(kind="index") multi-store summary ==========================
 //
 // Follow-up 16: a store failing mid-fan-out used to render identically to

@@ -1637,6 +1637,7 @@ impl CodesearchService {
             "mode": mode,
             "compact": request.compact,
             "semantic_mode": request.semantic_mode,
+            "min_score": request.min_score,
             "regex": request.regex,
             "phrase": request.phrase,
             "file_glob": request.file_glob,
@@ -1676,6 +1677,10 @@ impl CodesearchService {
         //    repos. Skip entirely when the group has no local repos.
         let (locals, _) = cfg.split_group_targets(&group);
         let mut local_items: Vec<SearchResultItem> = Vec::new();
+        // Refusal notes from legs that answered empty by their own threshold
+        // (min_score): merged into the response warnings, so an honest refusal
+        // never reads as "no hits there".
+        let mut leg_notes: Vec<String> = Vec::new();
         if !locals.is_empty() {
             let local_result = match mode.as_str() {
                 "semantic" => {
@@ -1687,7 +1692,7 @@ impl CodesearchService {
                         mode: request.semantic_mode.clone(),
                         project: None,
                         group: Some(group.clone()),
-                        min_score: None,
+                        min_score: request.min_score,
                     };
                     self.semantic_search(Parameters(req)).await?
                 }
@@ -1713,6 +1718,9 @@ impl CodesearchService {
                 }
             };
             local_items = parse_search_items_from_call_result(&local_result, &mode);
+            if let Some(note) = parse_note_from_call_result(&local_result) {
+                leg_notes.push(format!("local group: {note}"));
+            }
             retain_by_filter_path(&mut local_items, request.filter_path.as_deref());
         }
 
@@ -1759,13 +1767,19 @@ impl CodesearchService {
         let mut all_lists: Vec<Vec<SearchResultItem>> = vec![local_items];
         while let Some(res) = join.join_next().await {
             match res {
-                Ok((peer_name, remote_alias, Outcome::Ok(items))) => {
-                    let mut converted: Vec<SearchResultItem> = items
+                Ok((peer_name, remote_alias, Outcome::Ok(reply))) => {
+                    let mut converted: Vec<SearchResultItem> = reply
+                        .items
                         .into_iter()
                         .map(|it| convert_remote_item(&peer_name, &remote_alias, it))
                         .collect();
                     retain_by_filter_path(&mut converted, request.filter_path.as_deref());
                     all_lists.push(converted);
+                    if let Some(note) = reply.note {
+                        warnings.push(format!(
+                            "remote project '{peer_name}/{remote_alias}': {note}"
+                        ));
+                    }
                 }
                 Ok((peer_name, remote_alias, Outcome::Unreachable(reason))) => {
                     warnings.push(format!(
@@ -1779,7 +1793,9 @@ impl CodesearchService {
             }
         }
 
-        // 4) RRF-interleave the disjoint ranked lists and render.
+        // 4) RRF-interleave the disjoint ranked lists and render. Leg refusal
+        //    notes ride along as warnings, after the per-store failures.
+        warnings.extend(leg_notes);
         let merged = merge_ranked_lists(all_lists, DEFAULT_RRF_K, limit);
         Ok(self.build_federated_response(merged, warnings))
     }
@@ -1842,13 +1858,22 @@ impl CodesearchService {
 
         let outcome = client.search_project(&peer, body, &remote_alias).await;
         let (mut items, warnings) = match outcome {
-            Outcome::Ok(items) => (
-                items
-                    .into_iter()
-                    .map(|it| convert_remote_item(&peer_name, &remote_alias, it))
-                    .collect::<Vec<_>>(),
-                Vec::new(),
-            ),
+            Outcome::Ok(reply) => {
+                let mut peer_warnings = Vec::new();
+                if let Some(note) = reply.note {
+                    peer_warnings.push(format!(
+                        "remote project '{peer_name}/{remote_alias}': {note}"
+                    ));
+                }
+                (
+                    reply
+                        .items
+                        .into_iter()
+                        .map(|it| convert_remote_item(&peer_name, &remote_alias, it))
+                        .collect::<Vec<_>>(),
+                    peer_warnings,
+                )
+            }
             Outcome::Unreachable(reason) => (
                 Vec::new(),
                 vec![format!(

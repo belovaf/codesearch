@@ -17,7 +17,7 @@ impl CodesearchService {
 
     /// Unified search tool — dispatches to semantic or literal search based on `mode`.
     #[tool(
-        description = "Unified code search. Set `mode` to choose the backend:\n\n- `semantic` (default): vector embeddings + BM25 FTS + exact-identifier boosting, fused with RRF. Best for conceptual queries, identifier lookups, and mixed natural-language + symbol queries.\n- `literal`: pure FTS, no embeddings. Fast and works without an embedding model. Sub-mode selection:\n  * Queries with operators, brackets, or punctuation (`foo = null`, `Vec<T>`, `return x;`, `a::b`) -> set `regex=true` and write the query as a regex. BM25 tokenizes on punctuation otherwise, producing noisy results.\n  * Multi-word exact phrases -> set `phrase=true`.\n  * Plain identifier lookups (`CodesearchService`) -> leave both false.\n\nFor semantic mode, optionally set `semantic_mode`: \"auto\" (default) | \"semantic\" | \"lexical\" | \"hybrid\".\nSet `min_score` to drop weak hits and answer with an explicit refusal (empty results + note) instead of nearest-neighbour noise; the score scale depends on `semantic_mode` — cosine similarity for \"semantic\", RRF points (rarely above 0.2) otherwise.\nReturns metadata only by default (`compact=true`). Use `get_chunk` to read full code. Prefer `search(mode=\"literal\", regex=true)` over external grep/ripgrep for code patterns.\n\nIMPORTANT (multi-repo): always specify either `project` (single repo) or `group` (cross-repo). Omitting both in multi-repo mode returns a `scope_required` error with the list of available projects and groups. If the user has not indicated which repository to search, ask them to choose."
+        description = "Unified code search. Set `mode` to choose the backend:\n\n- `semantic` (default): vector embeddings + BM25 FTS + exact-identifier boosting, fused with RRF. Best for conceptual queries, identifier lookups, and mixed natural-language + symbol queries.\n- `literal`: pure FTS, no embeddings. Fast and works without an embedding model. Sub-mode selection:\n  * Queries with operators, brackets, or punctuation (`foo = null`, `Vec<T>`, `return x;`, `a::b`) -> set `regex=true` and write the query as a regex. BM25 tokenizes on punctuation otherwise, producing noisy results.\n  * Multi-word exact phrases -> set `phrase=true`.\n  * Plain identifier lookups (`CodesearchService`) -> leave both false.\n\nFor semantic mode, optionally set `semantic_mode`: \"auto\" (default) | \"semantic\" | \"lexical\" | \"hybrid\".\nSet `min_score` to drop weak hits and answer with an explicit refusal (empty results + note) instead of nearest-neighbour noise; the score scale depends on `semantic_mode` — cosine similarity for \"semantic\", RRF points (rarely above 0.2) otherwise. Federated group/project queries forward `min_score` to every leg and surface each leg's refusal note in `warnings`. Not supported in `literal` mode — passing `min_score` with mode=\"literal\" returns an explicit error naming the field.\nReturns metadata only by default (`compact=true`). Use `get_chunk` to read full code. Prefer `search(mode=\"literal\", regex=true)` over external grep/ripgrep for code patterns.\n\nIMPORTANT (multi-repo): always specify either `project` (single repo) or `group` (cross-repo). Omitting both in multi-repo mode returns a `scope_required` error with the list of available projects and groups. If the user has not indicated which repository to search, ask them to choose."
     )]
     pub(crate) async fn search(
         &self,
@@ -30,6 +30,27 @@ impl CodesearchService {
             request.project,
             request.group,
         );
+
+        // `min_score` has no honest meaning in literal mode — BM25 scores are
+        // corpus-relative and unbounded, so a caller-supplied threshold cannot
+        // be calibrated the way semantic thresholds are. Refuse by name
+        // instead of silently dropping the field: the tool advertises it, and
+        // a silently ignored filter reads as "no weak hits existed". Checked
+        // before any routing so local, federated-group and mounted-project
+        // paths all behave identically.
+        if request.min_score.is_some()
+            && request
+                .mode
+                .as_deref()
+                .is_some_and(|m| m.eq_ignore_ascii_case("literal"))
+        {
+            return Ok(CallToolResult::success(vec![ContentBlock::text(
+                "min_score is not supported in literal mode: BM25 scores are corpus-relative \
+                 and unbounded, so a threshold would drop hits by an arbitrary rule. Re-run \
+                 without min_score, or use mode=\"semantic\" — there an emptied result set \
+                 comes back with an explicit refusal note naming the threshold.",
+            )]));
+        }
 
         // Federation: when the query targets a group that resolves to one or more
         // remote peers, merge local + remote results (RRF-interleave) instead of
