@@ -447,6 +447,13 @@ pub const FIND_IMPACT_PATH: &str = "/find-impact";
 /// Override with `CODESEARCH_REPO_IDLE_TIMEOUT_SECS`.
 pub const REPO_IDLE_TIMEOUT_SECS: u64 = 30 * 60; // 30 minutes
 
+/// Idle MCP session reap bound (rmcp `LocalSessionManager` keep_alive).
+/// A wedged session keeps its socket and its FIFO-serialized worker alive
+/// indefinitely; 30 minutes is far beyond any human pause in local
+/// interactive use, yet guarantees a stuck session eventually goes away
+/// without a serve restart.
+pub const MCP_IDLE_SESSION_SECS: u64 = 30 * 60; // 30 minutes
+
 /// How often the idle-reaper background task checks for repos to evict.
 pub const REAPER_INTERVAL_SECS: u64 = 5 * 60; // 5 minutes
 

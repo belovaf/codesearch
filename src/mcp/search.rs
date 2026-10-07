@@ -925,33 +925,33 @@ impl CodesearchService {
         // map straight back to their owning repo below.
         let mut interned: std::collections::HashMap<(String, u32), u32> =
             std::collections::HashMap::new();
-        fn intern_chunk(
-            map: &mut std::collections::HashMap<(String, u32), u32>,
-            key: (String, u32),
-        ) -> u32 {
-            let next = map.len() as u32;
-            *map.entry(key).or_insert(next)
-        }
 
         let vector_translated: Vec<crate::vectordb::SearchResult> = vector_results
             .iter()
             .map(|hit| {
                 let mut r = hit.result.clone();
-                r.id = intern_chunk(&mut interned, (hit.alias.clone(), r.id));
+                r.id =
+                    intern_group_chunk_id(&mut interned, (hit.alias.clone(), r.id));
                 r
             })
             .collect();
         let fts_translated: Vec<crate::fts::FtsResult> = fts_results
             .iter()
             .map(|hit| crate::fts::FtsResult {
-                chunk_id: intern_chunk(&mut interned, (hit.alias.clone(), hit.result.chunk_id)),
+                chunk_id: intern_group_chunk_id(
+                    &mut interned,
+                    (hit.alias.clone(), hit.result.chunk_id),
+                ),
                 score: hit.result.score,
             })
             .collect();
         let exact_translated: Vec<crate::fts::FtsResult> = all_exact
             .iter()
             .map(|hit| crate::fts::FtsResult {
-                chunk_id: intern_chunk(&mut interned, (hit.alias.clone(), hit.result.chunk_id)),
+                chunk_id: intern_group_chunk_id(
+                    &mut interned,
+                    (hit.alias.clone(), hit.result.chunk_id),
+                ),
                 score: hit.result.score,
             })
             .collect();

@@ -114,6 +114,53 @@ async fn get_chunk_routes_mounted_remote_projects_through_federation() {
 }
 
 #[test]
+fn idle_mcp_sessions_are_bounded_to_reap_after_30_minutes() {
+    // The idle-reap fix is exactly this configuration: keep_alive=None
+    // assumed TCP liveness would collect wedged sessions, but a stuck
+    // request keeps its socket and its FIFO-serialized worker alive
+    // indefinitely (observed active_sessions=4 with a single client).
+    // The bound must stay a plain half hour — far beyond any human pause in
+    // local interactive use, yet a guarantee the session eventually goes
+    // away without a serve restart.
+    let manager = crate::serve::session_manager_with_idle_reap();
+    assert_eq!(
+        manager.session_config.keep_alive,
+        Some(std::time::Duration::from_secs(crate::constants::MCP_IDLE_SESSION_SECS)),
+        "the reap bound must be configured on the rmcp session manager"
+    );
+    assert_eq!(
+        crate::constants::MCP_IDLE_SESSION_SECS,
+        30 * 60,
+        "the reap bound must stay at thirty minutes"
+    );
+}
+
+#[test]
+fn shutdown_drain_notice_bounds_the_pause_and_forbids_the_reflex_ctrl_c() {
+    // The notice exists because the ~3 s drain after `q` reads as a hang
+    // from the restored terminal, and the reflex second Ctrl-C hard-kills
+    // serve mid-drain (raw mode is already off, so it IS delivered). Every
+    // element matters: the bounded wait, the session count, and the
+    // explicit "exits by itself".
+    let quiet = crate::serve::tui::shutdown_drain_notice(0);
+    assert_eq!(quiet, "🛑 Shutting down…", "no sessions — no drain to explain");
+
+    let draining = crate::serve::tui::shutdown_drain_notice(4);
+    assert!(
+        draining.contains("4 open MCP session(s)"),
+        "the count of draining sessions must be named, got: {draining}"
+    );
+    assert!(
+        draining.contains("~3 s"),
+        "the visibly bounded wait is the whole point, got: {draining}"
+    );
+    assert!(
+        draining.contains("exiting by itself"),
+        "the user must be told NOT to intervene, got: {draining}"
+    );
+}
+
+#[test]
 fn tracked_session_drop_balances_active_sessions() {
     // A genuine MCP session increments on connect and the serve factory
     // marks it tracked, so Drop decrements and the counter returns to 0.
@@ -301,6 +348,44 @@ async fn remove_repo_quarantines_db_dir_when_delete_budget_expires() {
     );
 }
 
+#[tokio::test]
+async fn delete_repo_http_mapping_reports_a_quarantined_db_honestly() {
+    // The DELETE /repos/{alias} payload must not read "removed" when the DB
+    // dir survived the delete budget: the caller (an operator or an agent
+    // driving /repos) decides whether the disk still holds a stale index by
+    // `status` and `db_quarantined`. The quarantine outcome itself is pinned
+    // by remove_repo_quarantines_db_dir_when_delete_budget_expires; this
+    // pins its HTTP mapping.
+    let (_tmp, repo_path, state) = state_with_repo("qmap");
+    let state = Arc::new(state);
+    // A FILE as the db path: remove_dir_all fails every retry with a
+    // non-lock error, deterministically exhausting the budget into the
+    // quarantine branch on every OS.
+    std::fs::write(repo_path.join(DB_DIR_NAME), "not a directory").unwrap();
+
+    let (status, body) =
+        crate::serve::remove_repo_handler(axum::extract::Path("qmap".to_string()), axum::extract::State(state))
+            .await;
+
+    assert_eq!(status, axum::http::StatusCode::OK, "got body: {body:?}");
+    assert_eq!(
+        body["status"], "removed_db_quarantined",
+        "the status must name the honest outcome, got: {body:?}"
+    );
+    assert_eq!(
+        body["db_deleted"], false,
+        "a quarantined dir was NOT deleted, got: {body:?}"
+    );
+    let quarantine = body["db_quarantined"]
+        .as_str()
+        .expect("db_quarantined must be a string path")
+        .to_string();
+    assert!(
+        quarantine.contains(&format!("{DB_DIR_NAME}.removed-")),
+        "the payload must point at the quarantined sibling, got: {quarantine}"
+    );
+}
+
 #[test]
 fn sweep_removes_quarantine_remnants_and_leaves_everything_else() {
     // The quarantine rename leaves the survivor "for manual cleanup", and
@@ -321,7 +406,7 @@ fn sweep_removes_quarantine_remnants_and_leaves_everything_else() {
     let other = repo.join("notes.removed-manual");
     std::fs::create_dir_all(&other).unwrap();
 
-    crate::serve::sweep_quarantined_db_remnants(&[repo.clone()]);
+    crate::serve::sweep_quarantined_db_remnants(std::slice::from_ref(&repo));
 
     assert!(
         !remnant.exists(),
@@ -3103,6 +3188,87 @@ async fn a_second_format_recovery_for_the_same_alias_is_refused() {
     assert!(
         state.enqueue_format_recovery("other-repo"),
         "the refusal must be per alias, not global"
+    );
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn format_recovery_refuses_to_wipe_while_an_index_task_is_alive() {
+    // recover_repo_format's safety guard: wiping the DB dir from under a
+    // live indexing task can wedge the task while it holds the store handles
+    // and the process-wide job permit. The refusal branch ("did not stop
+    // within the cooperative budget; refusing to wipe") was pinned nowhere.
+    let (_tmp, repo_path, state) = state_with_repo("liverun");
+    let state = Arc::new(state);
+    let db_path = repo_path.join(DB_DIR_NAME);
+    std::fs::create_dir_all(&db_path).unwrap();
+    std::fs::write(db_path.join("data.mdb"), "fake").unwrap();
+
+    // A task with no cancellation point: it ignores the token the way a real
+    // build_index parked inside its synchronous arroy pass does. The sleep is
+    // virtual — with paused time the 5 s cooperative budget expires the
+    // instant the timeout is awaited.
+    let token = CancellationToken::new();
+    let handle = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+    });
+    state.index_tasks.insert(
+        "liverun".to_string(),
+        IndexTask {
+            handle,
+            token,
+            db_path: db_path.clone(),
+            started_at: Instant::now(),
+        },
+    );
+
+    let result = state.recover_repo_format("liverun").await;
+
+    let err = result.expect_err("a live indexing task must block the wipe");
+    assert!(
+        err.contains("refusing to wipe"),
+        "the refusal must say what it refused, got: {err}"
+    );
+    assert!(
+        db_path.exists(),
+        "the DB dir must survive a refused format-recovery wipe"
+    );
+    assert!(
+        !state.format_recovery_done.contains_key("liverun"),
+        "a refused wipe must not tombstone the alias"
+    );
+
+    // Cleanup: the parked task must not outlive the test. await_index_task
+    // put it back into the map ("keeping it tracked"), so abort from there.
+    if let Some((_, task)) = state.index_tasks.remove("liverun") {
+        task.handle.abort();
+    }
+}
+
+#[tokio::test]
+async fn format_recovery_permanent_delete_failure_surfaces_and_stays_retryable() {
+    // A non-lock delete failure (here: the db path is a regular file) must
+    // NOT burn the lock-class retry budget, must surface as an explicit
+    // error, and — because format_recovery_done records at the WIPE, not at
+    // the rebuild — the alias stays eligible for another attempt instead of
+    // entering the one-wipe-per-process tombstone on a wipe that never
+    // happened.
+    let (_tmp, repo_path, state) = state_with_repo("filerun");
+    let state = Arc::new(state);
+    let db_path = repo_path.join(DB_DIR_NAME);
+    // A FILE: remove_dir_all fails immediately with a non-lock error on
+    // every OS, deterministically taking the permanent-failure branch.
+    std::fs::write(&db_path, "not a directory").unwrap();
+
+    let result = state.recover_repo_format("filerun").await;
+    let err = result.expect_err("a permanent delete failure must surface");
+    assert!(
+        err.contains("could not wipe"),
+        "the error must name the failed wipe, got: {err}"
+    );
+    assert!(
+        state.enqueue_format_recovery("filerun"),
+        "a wipe that never happened must not tombstone the alias — the next \
+         corruption detection has to be able to retry once the holder is gone"
     );
 }
 

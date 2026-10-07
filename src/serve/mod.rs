@@ -39,9 +39,9 @@ use crate::constants::{
     CSHARP_PREWARM_MAX_SYMBOLS, CSHARP_SCIP_CONCURRENCY_DEFAULT, CSHARP_SCIP_CONCURRENCY_ENV,
     DB_DIR_NAME, DEFAULT_SERVE_PORT, DISABLE_HOST_VALIDATION_ENV, EXPLORE_PATH, FIND_IMPACT_PATH,
     FIND_PATH, HEALTHZ_PATH, HEALTH_PATH, INDEXING_PATH, LANG_CSHARP, LANG_TYPESCRIPT,
-    MAX_INDEXING_SECS, MAX_INDEXING_SECS_ENV, MCP_ENDPOINT_PATH, PERSIST_DEBOUNCE_SECS,
-    REAPER_INTERVAL_SECS, REMOTES_PATH, REPO_IDLE_TIMEOUT_ENV, REPO_IDLE_TIMEOUT_SECS, SEARCH_PATH,
-    SERVE_API_KEY_ENV, SERVE_PORT_ENV, STATUS_PATH,
+    MAX_INDEXING_SECS, MAX_INDEXING_SECS_ENV, MCP_ENDPOINT_PATH, MCP_IDLE_SESSION_SECS,
+    PERSIST_DEBOUNCE_SECS, REAPER_INTERVAL_SECS, REMOTES_PATH, REPO_IDLE_TIMEOUT_ENV,
+    REPO_IDLE_TIMEOUT_SECS, SEARCH_PATH, SERVE_API_KEY_ENV, SERVE_PORT_ENV, STATUS_PATH,
 };
 use crate::db_discovery::repos::{config_dir, ReposConfig};
 use crate::index::{
@@ -6333,6 +6333,18 @@ fn keep_warm_foreign_target(ping_url: &str, self_host: &str) -> Option<String> {
     }
 }
 
+// rmcp session manager bounded to reap idle MCP sessions. Extracted so the
+// reap contract is pinned by a test instead of only by the CHANGELOG claim:
+// `keep_alive = None` assumed TCP liveness would collect wedged sessions,
+// but a stuck request keeps its socket and its FIFO-serialized worker alive
+// indefinitely (observed active_sessions=4 with a single client).
+pub(crate) fn session_manager_with_idle_reap() -> LocalSessionManager {
+    let mut manager = LocalSessionManager::default();
+    manager.session_config.keep_alive =
+        Some(std::time::Duration::from_secs(MCP_IDLE_SESSION_SECS));
+    manager
+}
+
 // Best-effort startup sweep of quarantined DB remnants. remove_repo's
 // delete-budget fallback renames a surviving db dir aside as
 // `<DB_DIR_NAME>.removed-<unix_ms>` "for manual cleanup" — and manual is
@@ -6651,8 +6663,7 @@ pub async fn run_serve(
     // 30 minutes is far beyond any human pause in local interactive use,
     // yet guarantees a stuck session — and its FIFO-serialized request
     // queue — eventually goes away without a serve restart.
-    let mut session_manager = LocalSessionManager::default();
-    session_manager.session_config.keep_alive = Some(std::time::Duration::from_secs(1800));
+    let session_manager = session_manager_with_idle_reap();
     let session_manager = Arc::new(session_manager);
 
     // Configure the rmcp Streamable HTTP server's DNS-rebinding defence

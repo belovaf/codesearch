@@ -69,18 +69,25 @@ pub async fn run_tui(
     // force-exiting — from the terminal this pause looks like a hang, so say so.
     let user_quit = result.as_ref().is_ok_and(|quit| *quit);
     if user_quit {
-        let active = session_probe.active_session_count();
-        if active == 0 {
-            println!("🛑 Shutting down…");
-        } else {
-            println!(
-                "🛑 Shutting down: waiting up to ~3 s for {active} open MCP session(s) to drain, \
-                 then exiting by itself — no Ctrl-C needed."
-            );
-        }
+        println!("{}", shutdown_drain_notice(session_probe.active_session_count()));
     }
 
     result.map(|_| ())
+}
+
+/// The post-`q` shutdown notice. Extracted so its contract is pinned by a
+/// test: name the bounded wait (~3 s), count the draining sessions, and say
+/// the process exits by itself — the notice exists precisely to stop the
+/// reflex second Ctrl-C that hard-kills serve mid-drain once raw mode is off.
+pub(crate) fn shutdown_drain_notice(active_sessions: u64) -> String {
+    if active_sessions == 0 {
+        "🛑 Shutting down…".to_string()
+    } else {
+        format!(
+            "🛑 Shutting down: waiting up to ~3 s for {active_sessions} open MCP session(s) to \
+             drain, then exiting by itself — no Ctrl-C needed."
+        )
+    }
 }
 
 async fn run_tui_loop(

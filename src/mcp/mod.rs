@@ -136,6 +136,22 @@ pub(crate) fn mixed_model_group_warning<I: IntoIterator<Item = ModelType>>(
     ))
 }
 
+/// Intern a (repo, chunk_id) pair to a unique synthetic id for the group
+/// RRF fusion call.
+///
+/// The pure fusion functions key on a single bare u32, but chunk ids are
+/// per-repo counters and collide across a group — two repos' chunk id 0
+/// fused into ONE entry. Every (alias, id) pair maps to its own synthetic
+/// id; the fused ids map straight back through the same table. Extracted
+/// so the collision contract is unit-testable without standing up stores.
+pub(crate) fn intern_group_chunk_id(
+    map: &mut std::collections::HashMap<(String, u32), u32>,
+    key: (String, u32),
+) -> u32 {
+    let next = map.len() as u32;
+    *map.entry(key).or_insert(next)
+}
+
 use crate::db_discovery::{find_best_database, load_repos_config};
 use crate::embed::{EmbeddingServicePool, ModelType};
 use crate::file::Language;

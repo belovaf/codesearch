@@ -2321,6 +2321,62 @@ fn build_remote_search_body_forwards_min_score_to_peers() {
 }
 
 #[test]
+fn group_fusion_interning_gives_colliding_chunk_ids_distinct_synthetic_ids() {
+    // The group fusion feeds the pure rrf_fusion, which keys on a single
+    // bare u32 — two repos both holding local chunk id 0 used to fuse into
+    // ONE entry, silently dropping a whole repo's hit. The interning table
+    // is the fix; this pins its contract at the unit level, without
+    // standing up stores.
+    use std::collections::HashMap;
+
+    fn vector_hit(id: u32, score: f32) -> crate::vectordb::SearchResult {
+        crate::vectordb::SearchResult {
+            id,
+            content: String::new(),
+            path: format!("file{id}.rs"),
+            start_line: 0,
+            end_line: 1,
+            kind: "Function".to_string(),
+            signature: None,
+            docstring: None,
+            context: None,
+            hash: String::new(),
+            distance: 1.0 - score,
+            score,
+            context_prev: None,
+            context_next: None,
+        }
+    }
+
+    // The collision the old bare-u32 fusion actually hit: same chunk id,
+    // different repos — one fused entry.
+    let colliding = vec![vector_hit(0, 0.9), vector_hit(0, 0.8)];
+    let fused_colliding = crate::rerank::rrf_fusion(&colliding, &[], 60.0);
+    assert_eq!(
+        fused_colliding.len(),
+        1,
+        "bare ids must collide in rrf_fusion — this is what interning exists to fix"
+    );
+
+    let mut interned: HashMap<(String, u32), u32> = HashMap::new();
+    let a = super::intern_group_chunk_id(&mut interned, ("alpha".to_string(), 0));
+    let b = super::intern_group_chunk_id(&mut interned, ("beta".to_string(), 0));
+    assert_ne!(a, b, "same local id in different repos must intern apart");
+
+    // Repeat lookups return the SAME synthetic id — the reverse table maps
+    // fused ids back to owners, so re-interning would orphan results.
+    let a_again = super::intern_group_chunk_id(&mut interned, ("alpha".to_string(), 0));
+    assert_eq!(a, a_again, "re-interning the same pair must be stable");
+
+    // With interned ids both hits survive the fusion.
+    let interned_hits = vec![vector_hit(a, 0.9), vector_hit(b, 0.8)];
+    let fused = crate::rerank::rrf_fusion(&interned_hits, &[], 60.0);
+    assert_eq!(fused.len(), 2, "interned ids must keep both repos' hits");
+    assert_eq!(fused[0].chunk_id, a, "rank order follows the input scores");
+    assert_eq!(fused[1].chunk_id, b, "rank order follows the input scores");
+}
+
+#[test]
 fn mixed_model_group_warning_fires_only_for_genuinely_mixed_groups() {
     use crate::embed::ModelType;
 
