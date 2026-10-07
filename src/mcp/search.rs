@@ -640,6 +640,11 @@ impl CodesearchService {
         // disk). Dropped from the VECTOR fan-out only — the FTS pass still
         // covers them, since literal search needs no embeddings.
         let mut no_model_aliases: Vec<String> = Vec::new();
+        // Distinct models that actually answered (embedding resolved): a
+        // group mixing them produces scores from different vector spaces,
+        // which the merge presents as one ranking.
+        let mut answering_models: std::collections::HashSet<crate::embed::ModelType> =
+            std::collections::HashSet::new();
         {
             let mut by_model: std::collections::HashMap<crate::embed::ModelType, Vec<f32>> =
                 std::collections::HashMap::new();
@@ -709,6 +714,7 @@ impl CodesearchService {
                     },
                 };
                 embeddings_by_alias.insert(alias.clone(), embedding);
+                answering_models.insert(model);
             }
             for (model, missing) in missing_by_model {
                 model_warnings.push(format!(
@@ -721,6 +727,14 @@ impl CodesearchService {
                 ));
                 no_model_aliases.extend(missing);
             }
+        }
+
+        // A mixed-model group answers with scores from different vector
+        // spaces, which the merged ranking presents as one scale. Warn in
+        // every mode: RRF fusion (auto/hybrid) partially hides it by fusing
+        // ranks only; semantic_mode's raw cosine scores expose it directly.
+        if let Some(warning) = mixed_model_group_warning(answering_models) {
+            model_warnings.push(warning);
         }
 
         // Search vector stores across all repos, each with its own model's

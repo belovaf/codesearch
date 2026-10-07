@@ -2320,6 +2320,44 @@ fn build_remote_search_body_forwards_min_score_to_peers() {
     assert_eq!(body["mode"], "semantic", "body must keep its shape: {body}");
 }
 
+#[test]
+fn mixed_model_group_warning_fires_only_for_genuinely_mixed_groups() {
+    use crate::embed::ModelType;
+
+    // One model — even repeated by several repos — is one scale.
+    assert!(
+        super::mixed_model_group_warning([ModelType::AllMiniLML6V2Q]).is_none(),
+        "a single-model group must not warn"
+    );
+    assert!(
+        super::mixed_model_group_warning([
+            ModelType::AllMiniLML6V2Q,
+            ModelType::AllMiniLML6V2Q,
+        ])
+        .is_none(),
+        "the same model across repos is still one scale"
+    );
+
+    let warning = super::mixed_model_group_warning([
+        ModelType::AllMiniLML6V2Q,
+        ModelType::BGESmallENV15,
+    ])
+    .expect("a genuinely mixed group must warn");
+    assert!(
+        warning.contains("NOT comparable"),
+        "the warning must say the scores are not comparable: {warning}"
+    );
+    for name in [
+        ModelType::AllMiniLML6V2Q.short_name(),
+        ModelType::BGESmallENV15.short_name(),
+    ] {
+        assert!(
+            warning.contains(name),
+            "every distinct model must be named ('{name}' missing): {warning}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn search_refuses_min_score_in_literal_mode_by_name() {
     use rmcp::handler::server::wrapper::Parameters;

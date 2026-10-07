@@ -111,6 +111,31 @@ pub(crate) fn try_vector_read_or_note<'a>(
     }
 }
 
+/// Warning for a group whose answering repos embed with more than one model.
+///
+/// Cosine distance is only meaningful inside a single model's vector space,
+/// yet the group merge ranks hits from different models side by side as if
+/// one scale sorted them. Extracted so the contract — fire only when the
+/// models are genuinely mixed, name every distinct model, explain that each
+/// score is within-repo relevance only — is testable without standing up
+/// two on-disk embedding models.
+pub(crate) fn mixed_model_group_warning<I: IntoIterator<Item = ModelType>>(
+    models: I,
+) -> Option<String> {
+    let distinct: std::collections::HashSet<ModelType> = models.into_iter().collect();
+    if distinct.len() < 2 {
+        return None;
+    }
+    let mut names: Vec<&str> = distinct.iter().map(|m| m.short_name()).collect();
+    names.sort_unstable();
+    Some(format!(
+        "group mixes {} embedding models ({}) — scores are NOT comparable \
+         across repos; read each hit's score as within-repo relevance only",
+        names.len(),
+        names.join(", ")
+    ))
+}
+
 use crate::db_discovery::{find_best_database, load_repos_config};
 use crate::embed::{EmbeddingServicePool, ModelType};
 use crate::file::Language;
